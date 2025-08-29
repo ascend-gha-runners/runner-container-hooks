@@ -99,7 +99,7 @@ export async function createPod(
   if (useKubeScheduler()) {
     appPod.spec.affinity = await getPodAffinity(nodeName)
   } else {
-    appPod.spec.nodeName = nodeName
+    appPod.spec.affinity = await getPreferredPodAffinity(nodeName)
   }
   const claimName = getVolumeClaimName()
   appPod.spec.volumes = [
