@@ -564,28 +564,32 @@ async function getPodAffinity(nodeName: string): Promise<k8s.V1Affinity> {
   return affinity
 }
 
-async function getPreferredPodAffinity(nodeName: string): Promise<k8s.V1Affinity> {
-  const affinity = new k8s.V1Affinity();
-  affinity.nodeAffinity = new k8s.V1NodeAffinity();
-  
+async function getPreferredPodAffinity(
+  nodeName: string
+): Promise<k8s.V1Affinity> {
+  const affinity = new k8s.V1Affinity()
+  affinity.nodeAffinity = new k8s.V1NodeAffinity()
+
   // 创建 PreferredSchedulingTerm 对象
-  const preferredTerm = new k8s.V1PreferredSchedulingTerm();
-  preferredTerm.weight = 1; // 设置权重（1-100）
-  
+  const preferredTerm = new k8s.V1PreferredSchedulingTerm()
+  preferredTerm.weight = 1 // 设置权重（1-100）
+
   // 创建 NodeSelectorTerm
-  preferredTerm.preference = new k8s.V1NodeSelectorTerm();
+  preferredTerm.preference = new k8s.V1NodeSelectorTerm()
   preferredTerm.preference.matchExpressions = [
     {
       key: 'kubernetes.io/hostname',
       operator: 'In',
       values: [nodeName]
     }
-  ];
+  ]
 
   // 将 PreferredSchedulingTerm 添加到数组中
-  affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution = [preferredTerm];
-  
-  return affinity;
+  affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution = [
+    preferredTerm
+  ]
+
+  return affinity
 }
 
 export function namespace(): string {
