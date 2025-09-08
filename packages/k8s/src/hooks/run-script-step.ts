@@ -11,6 +11,7 @@ export async function runScriptStep(
   state,
   responseFile
 ): Promise<void> {
+  core.info(`HOOK: runScriptStep: ${JSON.stringify(args)}`)
   const { entryPoint, entryPointArgs, environmentVariables } = args
   const { containerPath, runnerPath } = writeEntryPointScript(
     args.workingDirectory,

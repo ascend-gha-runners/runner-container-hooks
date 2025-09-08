@@ -22,6 +22,7 @@ import { JOB_CONTAINER_EXTENSION_NAME, JOB_CONTAINER_NAME } from './constants'
 export async function runContainerStep(
   stepContainer: RunContainerStepArgs
 ): Promise<number> {
+  core.info(`HOOK: runContainerStep: ${JSON.stringify(stepContainer)}`) 
   if (stepContainer.dockerfile) {
     throw new Error('Building container actions is not currently supported')
   }

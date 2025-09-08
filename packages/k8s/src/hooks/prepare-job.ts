@@ -32,6 +32,7 @@ export async function prepareJob(
   args: PrepareJobArgs,
   responseFile
 ): Promise<void> {
+  core.info(`HOOK: prepareJob: ${JSON.stringify(args)}`)
   if (!args.container) {
     throw new Error('Job Container is required.')
   }
