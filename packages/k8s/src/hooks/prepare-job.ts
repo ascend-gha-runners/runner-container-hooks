@@ -1,32 +1,39 @@
 import * as core from '@actions/core'
-import * as io from '@actions/io'
 import * as k8s from '@kubernetes/client-node'
 import {
   JobContainerInfo,
   ContextPorts,
   PrepareJobArgs,
-  writeToResponseFile
+  writeToResponseFile,
+  ServiceContainerInfo
 } from 'hooklib'
-import path from 'path'
 import {
   containerPorts,
-  createPod,
+  createJobPod,
   isPodContainerAlpine,
   prunePods,
   waitForPodPhases,
-  getPrepareJobTimeoutSeconds
+  getPrepareJobTimeoutSeconds,
+  execCpToPod,
+  execPodStep
 } from '../k8s'
 import {
-  containerVolumes,
+  CONTAINER_VOLUMES,
   DEFAULT_CONTAINER_ENTRY_POINT,
   DEFAULT_CONTAINER_ENTRY_POINT_ARGS,
   generateContainerName,
   mergeContainerWithOptions,
   readExtensionFromFile,
   PodPhase,
-  fixArgs
+  fixArgs,
+  prepareJobScript
 } from '../k8s/utils'
-import { CONTAINER_EXTENSION_PREFIX, JOB_CONTAINER_NAME } from './constants'
+import {
+  CONTAINER_EXTENSION_PREFIX,
+  getJobPodName,
+  JOB_CONTAINER_NAME
+} from './constants'
+import { dirname } from 'path'
 
 export async function prepareJob(
   args: PrepareJobArgs,
@@ -39,11 +46,9 @@ export async function prepareJob(
   await prunePods()
 
   const extension = readExtensionFromFile()
-  await copyExternalsToRoot()
 
   let container: k8s.V1Container | undefined = undefined
   if (args.container?.image) {
-    core.debug(`Using image '${args.container.image}' for job image`)
     container = createContainerSpec(
       args.container,
       JOB_CONTAINER_NAME,
@@ -55,7 +60,6 @@ export async function prepareJob(
   let services: k8s.V1Container[] = []
   if (args.services?.length) {
     services = args.services.map(service => {
-      core.debug(`Adding service '${service.image}' to pod definition`)
       return createContainerSpec(
         service,
         generateContainerName(service.image),
@@ -71,7 +75,8 @@ export async function prepareJob(
 
   let createdPod: k8s.V1Pod | undefined = undefined
   try {
-    createdPod = await createPod(
+    createdPod = await createJobPod(
+      getJobPodName(),
       container,
       services,
       args.container.registry,
@@ -91,6 +96,13 @@ export async function prepareJob(
     `Job pod created, waiting for it to come online ${createdPod?.metadata?.name}`
   )
 
+  const runnerWorkspace = dirname(process.env.RUNNER_WORKSPACE as string)
+
+  let prepareScript: { containerPath: string; runnerPath: string } | undefined
+  if (args.container?.userMountVolumes?.length) {
+    prepareScript = prepareJobScript(args.container.userMountVolumes || [])
+  }
+
   try {
     await waitForPodPhases(
       createdPod.metadata.name,
@@ -101,6 +113,28 @@ export async function prepareJob(
   } catch (err) {
     await prunePods()
     throw new Error(`pod failed to come online with error: ${err}`)
+  }
+
+  await execCpToPod(createdPod.metadata.name, runnerWorkspace, '/__w')
+
+  if (prepareScript) {
+    await execPodStep(
+      ['sh', '-e', prepareScript.containerPath],
+      createdPod.metadata.name,
+      JOB_CONTAINER_NAME
+    )
+
+    const promises: Promise<void>[] = []
+    for (const vol of args?.container?.userMountVolumes || []) {
+      promises.push(
+        execCpToPod(
+          createdPod.metadata.name,
+          vol.sourceVolumePath,
+          vol.targetVolumePath
+        )
+      )
+    }
+    await Promise.all(promises)
   }
 
   core.debug('Job pod is ready for traffic')
@@ -126,7 +160,7 @@ function generateResponseFile(
   responseFile: string,
   args: PrepareJobArgs,
   appPod: k8s.V1Pod,
-  isAlpine
+  isAlpine: boolean
 ): void {
   if (!appPod.metadata?.name) {
     throw new Error('app pod must have metadata.name specified')
@@ -167,7 +201,9 @@ function generateResponseFile(
         const ctxPorts: ContextPorts = {}
         if (c.ports?.length) {
           for (const port of c.ports) {
-            ctxPorts[port.containerPort] = port.hostPort
+            if (port.containerPort && port.hostPort) {
+              ctxPorts[port.containerPort.toString()] = port.hostPort.toString()
+            }
           }
         }
 
@@ -181,19 +217,8 @@ function generateResponseFile(
   writeToResponseFile(responseFile, JSON.stringify(response))
 }
 
-async function copyExternalsToRoot(): Promise<void> {
-  const workspace = process.env['RUNNER_WORKSPACE']
-  if (workspace) {
-    await io.cp(
-      path.join(workspace, '../../externals'),
-      path.join(workspace, '../externals'),
-      { force: true, recursive: true, copySourceDirectory: false }
-    )
-  }
-}
-
 export function createContainerSpec(
-  container: JobContainerInfo,
+  container: JobContainerInfo | ServiceContainerInfo,
   name: string,
   jobContainer = false,
   extension?: k8s.V1PodTemplateSpec
@@ -208,24 +233,24 @@ export function createContainerSpec(
     image: container.image,
     ports: containerPorts(container)
   } as k8s.V1Container
-  if (container.workingDirectory) {
-    podContainer.workingDir = container.workingDirectory
+  if (container['workingDirectory']) {
+    podContainer.workingDir = container['workingDirectory']
   }
 
   if (container.entryPoint) {
     podContainer.command = [container.entryPoint]
   }
 
-  if (container.entryPointArgs?.length > 0) {
+  if (container.entryPointArgs && container.entryPointArgs.length > 0) {
     podContainer.args = fixArgs(container.entryPointArgs)
   }
 
   podContainer.env = []
   for (const [key, value] of Object.entries(
-    container['environmentVariables']
+    container['environmentVariables'] || {}
   )) {
     if (value && key !== 'HOME') {
-      podContainer.env.push({ name: key, value: value as string })
+      podContainer.env.push({ name: key, value })
     }
   }
 
@@ -234,17 +259,14 @@ export function createContainerSpec(
     value: 'true'
   })
 
-  if (!('CI' in container['environmentVariables'])) {
+  if (!('CI' in (container['environmentVariables'] || {}))) {
     podContainer.env.push({
       name: 'CI',
       value: 'true'
     })
   }
 
-  podContainer.volumeMounts = containerVolumes(
-    container.userMountVolumes,
-    jobContainer
-  )
+  podContainer.volumeMounts = CONTAINER_VOLUMES
 
   if (!extension) {
     return podContainer
