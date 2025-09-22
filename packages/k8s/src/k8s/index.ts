@@ -96,7 +96,7 @@ export async function createJobPod(
       name: 'fs-init',
       image:
         process.env.ACTIONS_RUNNER_IMAGE ||
-        'ghcr.io/actions/actions-runner:latest',
+        'swr.cn-southwest-2.myhuaweicloud.com/base_image/actions/actions-runner:latest',
       command: ['sh', '-c', 'sudo mv /home/runner/externals/* /mnt/externals'],
       securityContext: {
         runAsGroup: 1001,
