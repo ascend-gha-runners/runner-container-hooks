@@ -15,11 +15,16 @@ export const ENV_USE_KUBE_SCHEDULER = 'ACTIONS_RUNNER_USE_KUBE_SCHEDULER'
 
 export const EXTERNALS_VOLUME_NAME = 'externals'
 export const GITHUB_VOLUME_NAME = 'github'
+export const WORK_VOLUME = 'work'
 
 export const CONTAINER_VOLUMES: k8s.V1VolumeMount[] = [
   {
     name: EXTERNALS_VOLUME_NAME,
     mountPath: '/__e'
+  },
+  {
+    name: WORK_VOLUME,
+    mountPath: '/__w'
   },
   {
     name: GITHUB_VOLUME_NAME,
@@ -102,7 +107,7 @@ export function writeContainerStepScript(
 rm "$0" # remove script after running
 mv /__w/_temp/_github_home /github/home && \
 mv /__w/_temp/_github_workflow /github/workflow && \
-mv /__w/_temp/_runner_file_commands /github/file_commands && \
+mv /__w/_temp/_runner_file_commands /github/file_commands || true && \
 mv /__w/${parts.join('/')}/ /github/workspace && \
 cd /github/workspace && \
 exec ${environmentPrefix} ${entryPoint} ${
@@ -291,5 +296,5 @@ export async function sleep(ms: number): Promise<void> {
 }
 
 export function listDirAllCommand(dir: string): string {
-  return `cd ${shlex.quote(dir)} && find . -not -path '*/_runner_hook_responses*' -exec stat -c '%b %n' {} \\;`
+  return `cd ${shlex.quote(dir)} && find . -not -path '*/_runner_hook_responses*' -exec stat -c '%s %n' {} \\;`
 }

@@ -20,8 +20,10 @@ import {
   listDirAllCommand,
   sleep,
   EXTERNALS_VOLUME_NAME,
-  GITHUB_VOLUME_NAME
+  GITHUB_VOLUME_NAME,
+  WORK_VOLUME
 } from './utils'
+import * as shlex from 'shlex'
 
 const kc = new k8s.KubeConfig()
 
@@ -91,13 +93,33 @@ export async function createJobPod(
 
   appPod.spec = new k8s.V1PodSpec()
   appPod.spec.containers = containers
+  appPod.spec.securityContext = {
+    fsGroup: 1001
+  }
+
+  // Extract working directory from GITHUB_WORKSPACE
+  // GITHUB_WORKSPACE is like /__w/repo-name/repo-name
+  const githubWorkspace = process.env.GITHUB_WORKSPACE
+  const workingDirPath = githubWorkspace?.split('/').slice(-2).join('/') ?? ''
+
+  const initCommands = [
+    'mkdir -p /mnt/externals',
+    'mkdir -p /mnt/work',
+    'mkdir -p /mnt/github',
+    'mv /home/runner/externals/* /mnt/externals/'
+  ]
+
+  if (workingDirPath) {
+    initCommands.push(`mkdir -p /mnt/work/${workingDirPath}`)
+  }
+
   appPod.spec.initContainers = [
     {
       name: 'fs-init',
       image:
         process.env.ACTIONS_RUNNER_IMAGE ||
         'ghcr.io/actions/actions-runner:latest',
-      command: ['sh', '-c', 'sudo mv /home/runner/externals/* /mnt/externals'],
+      command: ['sh', '-c', initCommands.join(' && ')],
       securityContext: {
         runAsGroup: 1001,
         runAsUser: 1001
@@ -106,6 +128,14 @@ export async function createJobPod(
         {
           name: EXTERNALS_VOLUME_NAME,
           mountPath: '/mnt/externals'
+        },
+        {
+          name: WORK_VOLUME,
+          mountPath: '/mnt/work'
+        },
+        {
+          name: GITHUB_VOLUME_NAME,
+          mountPath: '/mnt/github'
         }
       ]
     }
@@ -120,6 +150,10 @@ export async function createJobPod(
     },
     {
       name: GITHUB_VOLUME_NAME,
+      emptyDir: {}
+    },
+    {
+      name: WORK_VOLUME,
       emptyDir: {}
     }
   ]
@@ -169,33 +203,6 @@ export async function createContainerStepPod(
 
   appPod.spec = new k8s.V1PodSpec()
   appPod.spec.containers = [container]
-  appPod.spec.initContainers = [
-    {
-      name: 'fs-init',
-      image:
-        process.env.ACTIONS_RUNNER_IMAGE ||
-        'ghcr.io/actions/actions-runner:latest',
-      command: [
-        'bash',
-        '-c',
-        `sudo cp $(which sh) /mnt/externals/sh \
-        && sudo cp $(which tail) /mnt/externals/tail \
-        && sudo cp $(which env) /mnt/externals/env \
-        && sudo chmod -R 777 /mnt/externals`
-      ],
-      securityContext: {
-        runAsGroup: 1001,
-        runAsUser: 1001,
-        privileged: true
-      },
-      volumeMounts: [
-        {
-          name: EXTERNALS_VOLUME_NAME,
-          mountPath: '/mnt/externals'
-        }
-      ]
-    }
-  ]
 
   appPod.spec.restartPolicy = 'Never'
 
@@ -206,6 +213,10 @@ export async function createContainerStepPod(
     },
     {
       name: GITHUB_VOLUME_NAME,
+      emptyDir: {}
+    },
+    {
+      name: WORK_VOLUME,
       emptyDir: {}
     }
   ]
@@ -271,19 +282,18 @@ export async function execPodStep(
   })
 }
 
-export async function execCalculateOutputHash(
+export async function execCalculateOutputHashSorted(
   podName: string,
   containerName: string,
   command: string[]
 ): Promise<string> {
   const exec = new k8s.Exec(kc)
 
-  // Create a writable stream that updates a SHA-256 hash with stdout data
-  const hash = createHash('sha256')
-  const hashWriter = new stream.Writable({
+  let output = ''
+  const outputWriter = new stream.Writable({
     write(chunk, _enc, cb) {
       try {
-        hash.update(chunk.toString('utf8') as Buffer)
+        output += chunk.toString('utf8')
         cb()
       } catch (e) {
         cb(e as Error)
@@ -298,7 +308,7 @@ export async function execCalculateOutputHash(
         podName,
         containerName,
         command,
-        hashWriter, // capture stdout for hashing
+        outputWriter, // capture stdout
         process.stderr,
         null,
         false /* tty */,
@@ -320,27 +330,46 @@ export async function execCalculateOutputHash(
       .catch(e => reject(e))
   })
 
-  // finalize hash and return digest
-  hashWriter.end()
+  outputWriter.end()
 
+  // Sort lines for consistent ordering across platforms
+  const sortedOutput =
+    output
+      .split('\n')
+      .filter(line => line.length > 0)
+      .sort()
+      .join('\n') + '\n'
+
+  const hash = createHash('sha256')
+  hash.update(sortedOutput)
   return hash.digest('hex')
 }
 
-export async function localCalculateOutputHash(
+export async function localCalculateOutputHashSorted(
   commands: string[]
 ): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
-    const hash = createHash('sha256')
     const child = spawn(commands[0], commands.slice(1), {
       stdio: ['ignore', 'pipe', 'ignore']
     })
 
+    let output = ''
     child.stdout.on('data', chunk => {
-      hash.update(chunk)
+      output += chunk.toString('utf8')
     })
     child.on('error', reject)
     child.on('close', (code: number) => {
       if (code === 0) {
+        // Sort lines for consistent ordering across distributions/platforms
+        const sortedOutput =
+          output
+            .split('\n')
+            .filter(line => line.length > 0)
+            .sort()
+            .join('\n') + '\n'
+
+        const hash = createHash('sha256')
+        hash.update(sortedOutput)
         resolve(hash.digest('hex'))
       } else {
         reject(new Error(`child process exited with code ${code}`))
@@ -360,7 +389,15 @@ export async function execCpToPod(
   while (true) {
     try {
       const exec = new k8s.Exec(kc)
-      const command = ['tar', 'xf', '-', '-C', containerPath]
+      // Use tar to extract with --no-same-owner to avoid ownership issues.
+      // Then use find to fix permissions. The -m flag helps but we also need to fix permissions after.
+      const command = [
+        'sh',
+        '-c',
+        `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
+          `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
+          `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null`
+      ]
       const readStream = tar.pack(runnerPath)
       const errStream = new WritableStreamBuffer()
       await new Promise((resolve, reject) => {
@@ -378,7 +415,7 @@ export async function execCpToPod(
               if (errStream.size()) {
                 reject(
                   new Error(
-                    `Error from cpFromPod - details: \n ${errStream.getContentsAsString()}`
+                    `Error from execCpToPod - status: ${status.status}, details: \n ${errStream.getContentsAsString()}`
                   )
                 )
               }
@@ -400,21 +437,21 @@ export async function execCpToPod(
     }
   }
 
-  const want = await localCalculateOutputHash([
-    'sh',
-    '-c',
-    listDirAllCommand(runnerPath)
-  ])
-
   let attempts = 15
   const delay = 1000
   for (let i = 0; i < attempts; i++) {
     try {
-      const got = await execCalculateOutputHash(podName, JOB_CONTAINER_NAME, [
+      const want = await localCalculateOutputHashSorted([
         'sh',
         '-c',
-        listDirAllCommand(containerPath)
+        listDirAllCommand(runnerPath)
       ])
+
+      const got = await execCalculateOutputHashSorted(
+        podName,
+        JOB_CONTAINER_NAME,
+        ['sh', '-c', listDirAllCommand(containerPath)]
+      )
 
       if (got !== want) {
         core.debug(
@@ -441,11 +478,6 @@ export async function execCpFromPod(
   core.debug(
     `Copying from pod ${podName} ${containerPath} to ${targetRunnerPath}`
   )
-  const want = await execCalculateOutputHash(podName, JOB_CONTAINER_NAME, [
-    'sh',
-    '-c',
-    listDirAllCommand(containerPath)
-  ])
 
   let attempt = 0
   while (true) {
@@ -506,7 +538,13 @@ export async function execCpFromPod(
   const delay = 1000
   for (let i = 0; i < attempts; i++) {
     try {
-      const got = await localCalculateOutputHash([
+      const want = await execCalculateOutputHashSorted(
+        podName,
+        JOB_CONTAINER_NAME,
+        ['sh', '-c', listDirAllCommand(containerPath)]
+      )
+
+      const got = await localCalculateOutputHashSorted([
         'sh',
         '-c',
         listDirAllCommand(targetRunnerPath)
