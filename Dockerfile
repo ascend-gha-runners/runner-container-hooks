@@ -6,8 +6,9 @@ COPY . /app/
 
 RUN npm install && npm run bootstrap && npm run build-all
 
-FROM ghcr.nju.edu.cn/actions/actions-runner:2.328.0
+FROM ghcr.nju.edu.cn/actions/actions-runner:2.329.0
 
 COPY --from=runner_builder /app/packages/k8s/dist/index.js /home/runner/k8s/index.js
 
 USER runner
+
