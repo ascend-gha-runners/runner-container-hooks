@@ -437,35 +437,26 @@ export async function execCpToPod(
     }
   }
 
-  let attempts = 15
-  const delay = 1000
-  for (let i = 0; i < attempts; i++) {
-    try {
-      const want = await localCalculateOutputHashSorted([
-        'sh',
-        '-c',
-        listDirAllCommand(runnerPath)
-      ])
+  try {
+    const want = await localCalculateOutputHashSorted([
+      'sh',
+      '-c',
+      listDirAllCommand(runnerPath)
+    ])
 
-      const got = await execCalculateOutputHashSorted(
-        podName,
-        JOB_CONTAINER_NAME,
-        ['sh', '-c', listDirAllCommand(containerPath)]
+    const got = await execCalculateOutputHashSorted(
+      podName,
+      JOB_CONTAINER_NAME,
+      ['sh', '-c', listDirAllCommand(containerPath)]
+    )
+
+    if (got !== want) {
+      core.debug(
+        `The hash of the directory does not match the expected value; want='${want}' got='${got}'`
       )
-
-      if (got !== want) {
-        core.debug(
-          `The hash of the directory does not match the expected value; want='${want}' got='${got}'`
-        )
-        await sleep(delay)
-        continue
-      }
-
-      break
-    } catch (error) {
-      core.debug(`Attempt ${i + 1} failed: ${error}`)
-      await sleep(delay)
     }
+  } catch (error) {
+    core.debug(`Attempt failed: ${error}`)
   }
 }
 
@@ -534,35 +525,26 @@ export async function execCpFromPod(
     }
   }
 
-  let attempts = 15
-  const delay = 1000
-  for (let i = 0; i < attempts; i++) {
-    try {
-      const want = await execCalculateOutputHashSorted(
-        podName,
-        JOB_CONTAINER_NAME,
-        ['sh', '-c', listDirAllCommand(containerPath)]
+  try {
+    const want = await execCalculateOutputHashSorted(
+      podName,
+      JOB_CONTAINER_NAME,
+      ['sh', '-c', listDirAllCommand(containerPath)]
+    )
+
+    const got = await localCalculateOutputHashSorted([
+      'sh',
+      '-c',
+      listDirAllCommand(targetRunnerPath)
+    ])
+
+    if (got !== want) {
+      core.debug(
+        `The hash of the directory does not match the expected value; want='${want}' got='${got}'`
       )
-
-      const got = await localCalculateOutputHashSorted([
-        'sh',
-        '-c',
-        listDirAllCommand(targetRunnerPath)
-      ])
-
-      if (got !== want) {
-        core.debug(
-          `The hash of the directory does not match the expected value; want='${want}' got='${got}'`
-        )
-        await sleep(delay)
-        continue
-      }
-
-      break
-    } catch (error) {
-      core.debug(`Attempt ${i + 1} failed: ${error}`)
-      await sleep(delay)
     }
+  } catch (error) {
+    core.debug(`Attempt failed: ${error}`)
   }
 }
 
