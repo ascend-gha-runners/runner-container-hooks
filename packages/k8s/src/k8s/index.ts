@@ -437,8 +437,7 @@ export async function execCpToPod(
     }
   }
 
-  let attempts = 15
-  const delay = 1000
+  let attempts = 1
   for (let i = 0; i < attempts; i++) {
     try {
       const want = await localCalculateOutputHashSorted([
@@ -457,14 +456,12 @@ export async function execCpToPod(
         core.debug(
           `The hash of the directory does not match the expected value; want='${want}' got='${got}'`
         )
-        await sleep(delay)
         continue
       }
 
       break
     } catch (error) {
       core.debug(`Attempt ${i + 1} failed: ${error}`)
-      await sleep(delay)
     }
   }
 }
@@ -534,8 +531,7 @@ export async function execCpFromPod(
     }
   }
 
-  let attempts = 15
-  const delay = 1000
+  let attempts = 1
   for (let i = 0; i < attempts; i++) {
     try {
       const want = await execCalculateOutputHashSorted(
@@ -554,14 +550,12 @@ export async function execCpFromPod(
         core.debug(
           `The hash of the directory does not match the expected value; want='${want}' got='${got}'`
         )
-        await sleep(delay)
         continue
       }
 
       break
     } catch (error) {
       core.debug(`Attempt ${i + 1} failed: ${error}`)
-      await sleep(delay)
     }
   }
 }
