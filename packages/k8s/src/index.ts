@@ -48,7 +48,14 @@ async function run(): Promise<void> {
         throw new Error(`Command not recognized: ${command}`)
     }
   } catch (error) {
-    core.error(error as Error)
+    const errMsg = error instanceof Error ? error.stack || error.message : String(error)
+    core.error('='.repeat(60))
+    core.error('HOOK FATAL ERROR — PrepareJob failed')
+    core.error('='.repeat(60))
+    core.error(errMsg)
+    core.error('='.repeat(60))
+    core.error('Sleeping 10 minutes to allow pod inspection for debugging...')
+    await new Promise(resolve => setTimeout(resolve, 10 * 60 * 1000))
     process.exit(1)
   }
 }
