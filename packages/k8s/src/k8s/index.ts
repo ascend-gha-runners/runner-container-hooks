@@ -477,17 +477,27 @@ export async function execCpToPod(
             }
           )
           .then(ws => {
-            core.debug(`[execCpToPod] WebSocket established, streaming tar to pod...`)
+            core.debug(
+              `[execCpToPod] WebSocket established, protocol="${ws.protocol}", streaming tar to pod...`
+            )
             // @kubernetes/client-node does NOT call statusCallback when the WebSocket
-            // closes without a status frame (e.g. API-server timeout, abrupt network drop).
-            // Without these handlers the Promise hangs forever, the event loop drains,
-            // and Node.js exits silently without writing the response file.
+            // closes without a status frame. This happens with k8s protocol < v5.channel.k8s.io:
+            // when stdin ends, handleStandardInput() calls ws.close() directly, which closes
+            // the entire WebSocket before the server can send the status on channel 3.
             ws.on('close', (code: number, reason: Buffer) => {
+              const reasonStr = reason?.toString() || ''
               core.debug(
-                `[execCpToPod] WebSocket closed: code=${code}, reason="${reason?.toString()}", callbackFired=${settled}`
+                `[execCpToPod] WebSocket closed: code=${code}, reason="${reasonStr}", settled=${settled}`
               )
+              if (code === 1000) {
+                // Normal close — exec command likely finished. statusCallback may not fire
+                // if the server protocol < v5.channel.k8s.io. Resolve here and let the
+                // hash-verification loop below confirm the copy actually landed in the pod.
+                safeResolve(undefined)
+                return
+              }
               safeReject(
-                new Error(`WebSocket closed before status callback: code=${code}, reason="${reason?.toString()}"`)
+                new Error(`WebSocket closed unexpectedly: code=${code}, reason="${reasonStr}"`)
               )
             })
             ws.on('error', (err: Error) => {
