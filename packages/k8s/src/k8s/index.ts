@@ -391,16 +391,57 @@ export async function execCpToPod(
       const exec = new k8s.Exec(kc)
       // Use tar to extract with --no-same-owner to avoid ownership issues.
       // Then use find to fix permissions. The -m flag helps but we also need to fix permissions after.
+      // stderr is NOT suppressed on tar so errors are visible in the runner debug log.
       const command = [
         'sh',
         '-c',
-        `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
+        `tar xf - --no-same-owner -C ${shlex.quote(containerPath)}; ` +
           `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
           `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null`
       ]
-      const readStream = tar.pack(runnerPath)
+
+      // Pre-pack diagnostic: log host directory info to help diagnose Linux environment issues.
+      try {
+        const { readdirSync } = await import('fs')
+        const entries = readdirSync(runnerPath, { withFileTypes: true })
+        const specialFiles = entries
+          .filter(e => !e.isFile() && !e.isDirectory() && !e.isSymbolicLink())
+          .map(e => {
+            const type = e.isFIFO() ? 'fifo'
+              : e.isSocket() ? 'socket'
+              : e.isBlockDevice() ? 'blockdev'
+              : e.isCharacterDevice() ? 'chardev'
+              : 'unknown'
+            return `${e.name}(${type})`
+          })
+        core.debug(
+          `[execCpToPod] host dir "${runnerPath}": totalEntries=${entries.length}, specialFiles=${specialFiles.join(',') || 'none'}`
+        )
+      } catch (statErr) {
+        core.debug(`[execCpToPod] pre-pack readdir failed: ${statErr}`)
+      }
+
+      // Track the last entry being packed so we know which file caused an error.
+      let lastPackedEntry = '<none yet>'
+      const readStream = tar.pack(runnerPath, {
+        map: (header: tar.Headers) => {
+          lastPackedEntry = header.name
+          return header
+        }
+      })
       const errStream = new WritableStreamBuffer()
+
       await new Promise((resolve, reject) => {
+        // Without this listener, an error from tar.pack() (e.g. unreadable file)
+        // would be an unhandled 'error' event and crash the Node.js process.
+        readStream.on('error', (err: Error) => {
+          const e = err as NodeJS.ErrnoException
+          core.debug(
+            `[execCpToPod] tar.pack error: code=${e.code}, path="${e.path}", lastEntry="${lastPackedEntry}", message="${e.message}"`
+          )
+          reject(new Error(`tar.pack error [${e.code}] on "${e.path ?? lastPackedEntry}": ${e.message}`))
+        })
+
         exec
           .exec(
             namespace(),
@@ -412,17 +453,25 @@ export async function execCpToPod(
             readStream,
             false,
             async status => {
-              if (errStream.size()) {
+              const stderr = errStream.getContentsAsString() || ''
+              core.debug(
+                `[execCpToPod] exec callback: status=${JSON.stringify(status)}, lastEntry="${lastPackedEntry}", stderr=${stderr || '(empty)'}`
+              )
+              if (status.status === 'Failure' || errStream.size()) {
                 reject(
                   new Error(
-                    `Error from execCpToPod - status: ${status.status}, details: \n ${errStream.getContentsAsString()}`
+                    `Error from execCpToPod - status: ${JSON.stringify(status)}, stderr:\n${stderr}`
                   )
                 )
+                return
               }
               resolve(status)
             }
           )
-          .catch(e => reject(e))
+          .catch(e => {
+            core.debug(`[execCpToPod] exec.exec() rejected: ${e}`)
+            reject(e)
+          })
       })
       break
     } catch (error) {
