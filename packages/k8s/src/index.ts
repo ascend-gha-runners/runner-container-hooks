@@ -60,6 +60,11 @@ async function run(): Promise<void> {
   }
 }
 
+process.on('SIGTERM', () => {
+  core.error('[GLOBAL] SIGTERM received — process killed by runner (likely hung too long)')
+  process.exit(143)
+})
+
 process.on('uncaughtException', (err: Error) => {
   const e = err as NodeJS.ErrnoException
   core.error(`[GLOBAL] uncaughtException: code=${e.code}, message=${e.message}`)

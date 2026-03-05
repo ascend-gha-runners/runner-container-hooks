@@ -400,26 +400,24 @@ export async function execCpToPod(
           `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null`
       ]
 
-      // Pre-pack diagnostic: log host directory info to help diagnose Linux environment issues.
-      try {
-        const { readdirSync } = await import('fs')
-        const entries = readdirSync(runnerPath, { withFileTypes: true })
-        const specialFiles = entries
-          .filter(e => !e.isFile() && !e.isDirectory() && !e.isSymbolicLink())
-          .map(e => {
-            const type = e.isFIFO() ? 'fifo'
-              : e.isSocket() ? 'socket'
-              : e.isBlockDevice() ? 'blockdev'
-              : e.isCharacterDevice() ? 'chardev'
-              : 'unknown'
-            return `${e.name}(${type})`
-          })
-        core.debug(
-          `[execCpToPod] host dir "${runnerPath}": totalEntries=${entries.length}, specialFiles=${specialFiles.join(',') || 'none'}`
-        )
-      } catch (statErr) {
-        core.debug(`[execCpToPod] pre-pack readdir failed: ${statErr}`)
-      }
+      // Pre-pack diagnostic: recursively find special files (socket/fifo/device) under runnerPath.
+      // Top-level check is insufficient — blocking files are often in subdirectories.
+      await new Promise<void>(resolve => {
+        const findProc = spawn('find', [
+          runnerPath, '-not', '-type', 'f',
+          '-not', '-type', 'd',
+          '-not', '-type', 'l'
+        ], { stdio: ['ignore', 'pipe', 'ignore'] })
+        let found = ''
+        findProc.stdout.on('data', (chunk: Buffer) => { found += chunk.toString() })
+        findProc.on('close', () => {
+          core.debug(
+            `[execCpToPod] recursive special files under "${runnerPath}": ${found.trim() || 'none'}`
+          )
+          resolve()
+        })
+        findProc.on('error', () => resolve())
+      })
 
       // Track the last entry being packed so we know which file caused an error.
       let lastPackedEntry = '<none yet>'
@@ -442,6 +440,11 @@ export async function execCpToPod(
           reject(new Error(`tar.pack error [${e.code}] on "${e.path ?? lastPackedEntry}": ${e.message}`))
         })
 
+        readStream.on('end', () => {
+          core.debug(`[execCpToPod] tar.pack stream ended, lastEntry="${lastPackedEntry}"`)
+        })
+
+        core.debug('[execCpToPod] calling exec.exec() to open WebSocket...')
         exec
           .exec(
             namespace(),
@@ -468,6 +471,9 @@ export async function execCpToPod(
               resolve(status)
             }
           )
+          .then(() => {
+            core.debug(`[execCpToPod] WebSocket established, streaming tar to pod...`)
+          })
           .catch(e => {
             core.debug(`[execCpToPod] exec.exec() rejected: ${e}`)
             reject(e)
