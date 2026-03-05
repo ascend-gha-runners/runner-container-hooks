@@ -430,6 +430,11 @@ export async function execCpToPod(
       const errStream = new WritableStreamBuffer()
 
       await new Promise((resolve, reject) => {
+        // Guard against double-settle: statusCallback, ws.close, and ws.error may all fire.
+        let settled = false
+        const safeResolve = (v: unknown): void => { if (!settled) { settled = true; resolve(v) } }
+        const safeReject = (e: unknown): void => { if (!settled) { settled = true; reject(e) } }
+
         // Without this listener, an error from tar.pack() (e.g. unreadable file)
         // would be an unhandled 'error' event and crash the Node.js process.
         readStream.on('error', (err: Error) => {
@@ -437,7 +442,7 @@ export async function execCpToPod(
           core.debug(
             `[execCpToPod] tar.pack error: code=${e.code}, path="${e.path}", lastEntry="${lastPackedEntry}", message="${e.message}"`
           )
-          reject(new Error(`tar.pack error [${e.code}] on "${e.path ?? lastPackedEntry}": ${e.message}`))
+          safeReject(new Error(`tar.pack error [${e.code}] on "${e.path ?? lastPackedEntry}": ${e.message}`))
         })
 
         readStream.on('end', () => {
@@ -461,22 +466,38 @@ export async function execCpToPod(
                 `[execCpToPod] exec callback: status=${JSON.stringify(status)}, lastEntry="${lastPackedEntry}", stderr=${stderr || '(empty)'}`
               )
               if (status.status === 'Failure' || errStream.size()) {
-                reject(
+                safeReject(
                   new Error(
                     `Error from execCpToPod - status: ${JSON.stringify(status)}, stderr:\n${stderr}`
                   )
                 )
                 return
               }
-              resolve(status)
+              safeResolve(status)
             }
           )
-          .then(() => {
+          .then(ws => {
             core.debug(`[execCpToPod] WebSocket established, streaming tar to pod...`)
+            // @kubernetes/client-node does NOT call statusCallback when the WebSocket
+            // closes without a status frame (e.g. API-server timeout, abrupt network drop).
+            // Without these handlers the Promise hangs forever, the event loop drains,
+            // and Node.js exits silently without writing the response file.
+            ws.on('close', (code: number, reason: Buffer) => {
+              core.debug(
+                `[execCpToPod] WebSocket closed: code=${code}, reason="${reason?.toString()}", callbackFired=${settled}`
+              )
+              safeReject(
+                new Error(`WebSocket closed before status callback: code=${code}, reason="${reason?.toString()}"`)
+              )
+            })
+            ws.on('error', (err: Error) => {
+              core.debug(`[execCpToPod] WebSocket error: ${err}`)
+              safeReject(err)
+            })
           })
           .catch(e => {
             core.debug(`[execCpToPod] exec.exec() rejected: ${e}`)
-            reject(e)
+            safeReject(e)
           })
       })
       break
