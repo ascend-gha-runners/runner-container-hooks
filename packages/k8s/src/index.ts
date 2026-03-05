@@ -60,4 +60,19 @@ async function run(): Promise<void> {
   }
 }
 
+process.on('uncaughtException', (err: Error) => {
+  const e = err as NodeJS.ErrnoException
+  core.error(`[GLOBAL] uncaughtException: code=${e.code}, message=${e.message}`)
+  core.error(e.stack ?? String(e))
+  process.exit(1)
+})
+
+process.on('unhandledRejection', (reason: unknown) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason))
+  const e = err as NodeJS.ErrnoException
+  core.error(`[GLOBAL] unhandledRejection: code=${e.code}, message=${e.message}`)
+  core.error(e.stack ?? String(e))
+  process.exit(1)
+})
+
 void run()
