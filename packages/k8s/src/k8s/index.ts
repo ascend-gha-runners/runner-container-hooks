@@ -391,16 +391,65 @@ export async function execCpToPod(
       const exec = new k8s.Exec(kc)
       // Use tar to extract with --no-same-owner to avoid ownership issues.
       // Then use find to fix permissions. The -m flag helps but we also need to fix permissions after.
+      // stderr is NOT suppressed on tar so errors are visible in the runner debug log.
       const command = [
         'sh',
         '-c',
-        `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
+        `tar xf - --no-same-owner -C ${shlex.quote(containerPath)}; ` +
           `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
           `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null`
       ]
-      const readStream = tar.pack(runnerPath)
+
+      // Pre-pack diagnostic: recursively find special files (socket/fifo/device) under runnerPath.
+      // Top-level check is insufficient — blocking files are often in subdirectories.
+      await new Promise<void>(resolve => {
+        const findProc = spawn('find', [
+          runnerPath, '-not', '-type', 'f',
+          '-not', '-type', 'd',
+          '-not', '-type', 'l'
+        ], { stdio: ['ignore', 'pipe', 'ignore'] })
+        let found = ''
+        findProc.stdout.on('data', (chunk: Buffer) => { found += chunk.toString() })
+        findProc.on('close', () => {
+          core.debug(
+            `[execCpToPod] recursive special files under "${runnerPath}": ${found.trim() || 'none'}`
+          )
+          resolve()
+        })
+        findProc.on('error', () => resolve())
+      })
+
+      // Track the last entry being packed so we know which file caused an error.
+      let lastPackedEntry = '<none yet>'
+      const readStream = tar.pack(runnerPath, {
+        map: (header: tar.Headers) => {
+          lastPackedEntry = header.name
+          return header
+        }
+      })
       const errStream = new WritableStreamBuffer()
+
       await new Promise((resolve, reject) => {
+        // Guard against double-settle: statusCallback, ws.close, and ws.error may all fire.
+        let settled = false
+        const safeResolve = (v: unknown): void => { if (!settled) { settled = true; resolve(v) } }
+        const safeReject = (e: unknown): void => { if (!settled) { settled = true; reject(e) } }
+
+        // Without this listener, an error from tar.pack() (e.g. unreadable file)
+        // would be an unhandled 'error' event and crash the Node.js process.
+        readStream.on('error', (err: Error) => {
+          const e = err as NodeJS.ErrnoException
+          core.debug(
+            `[execCpToPod] tar.pack error: code=${e.code}, path="${e.path}", lastEntry="${lastPackedEntry}", message="${e.message}"`
+          )
+          safeReject(new Error(`tar.pack error [${e.code}] on "${e.path ?? lastPackedEntry}": ${e.message}`))
+        })
+
+        readStream.on('end', () => {
+          core.debug(`[execCpToPod] tar.pack stream ended, lastEntry="${lastPackedEntry}"`)
+        })
+
+        core.debug('[execCpToPod] calling exec.exec() to open WebSocket...')
         exec
           .exec(
             namespace(),
@@ -412,17 +461,54 @@ export async function execCpToPod(
             readStream,
             false,
             async status => {
-              if (errStream.size()) {
-                reject(
+              const stderr = errStream.getContentsAsString() || ''
+              core.debug(
+                `[execCpToPod] exec callback: status=${JSON.stringify(status)}, lastEntry="${lastPackedEntry}", stderr=${stderr || '(empty)'}`
+              )
+              if (status.status === 'Failure' || errStream.size()) {
+                safeReject(
                   new Error(
-                    `Error from execCpToPod - status: ${status.status}, details: \n ${errStream.getContentsAsString()}`
+                    `Error from execCpToPod - status: ${JSON.stringify(status)}, stderr:\n${stderr}`
                   )
                 )
+                return
               }
-              resolve(status)
+              safeResolve(status)
             }
           )
-          .catch(e => reject(e))
+          .then(ws => {
+            core.debug(
+              `[execCpToPod] WebSocket established, protocol="${ws.protocol}", streaming tar to pod...`
+            )
+            // @kubernetes/client-node does NOT call statusCallback when the WebSocket
+            // closes without a status frame. This happens with k8s protocol < v5.channel.k8s.io:
+            // when stdin ends, handleStandardInput() calls ws.close() directly, which closes
+            // the entire WebSocket before the server can send the status on channel 3.
+            ws.on('close', (code: number, reason: Buffer) => {
+              const reasonStr = reason?.toString() || ''
+              core.debug(
+                `[execCpToPod] WebSocket closed: code=${code}, reason="${reasonStr}", settled=${settled}`
+              )
+              if (code === 1000) {
+                // Normal close — exec command likely finished. statusCallback may not fire
+                // if the server protocol < v5.channel.k8s.io. Resolve here and let the
+                // hash-verification loop below confirm the copy actually landed in the pod.
+                safeResolve(undefined)
+                return
+              }
+              safeReject(
+                new Error(`WebSocket closed unexpectedly: code=${code}, reason="${reasonStr}"`)
+              )
+            })
+            ws.on('error', (err: Error) => {
+              core.debug(`[execCpToPod] WebSocket error: ${err}`)
+              safeReject(err)
+            })
+          })
+          .catch(e => {
+            core.debug(`[execCpToPod] exec.exec() rejected: ${e}`)
+            safeReject(e)
+          })
       })
       break
     } catch (error) {
