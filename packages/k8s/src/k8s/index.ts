@@ -368,6 +368,164 @@ export async function pruneSecrets(): Promise<void> {
   )
 }
 
+export const UNRECOVERABLE_WAITING_REASONS = new Set([
+  'ImagePullBackOff',
+  'ErrImagePull',
+  'InvalidImageName',
+  'CreateContainerConfigError',
+  'CreateContainerError'
+])
+
+const MAX_DIAGNOSTIC_EVENTS = 10
+
+export function getUnrecoverableWaitingReasons(): Set<string> {
+  const extra = process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_WAITING_REASONS']
+  if (!extra) {
+    return UNRECOVERABLE_WAITING_REASONS
+  }
+  const reasons = new Set(UNRECOVERABLE_WAITING_REASONS)
+  for (const reason of extra.split(',')) {
+    const trimmed = reason.trim()
+    if (trimmed) {
+      reasons.add(trimmed)
+    }
+  }
+  return reasons
+}
+
+export function getContainerErrors(pod: k8s.V1Pod): string[] {
+  const errors: string[] = []
+  const unrecoverableReasons = getUnrecoverableWaitingReasons()
+  const allStatuses = [
+    ...(pod.status?.initContainerStatuses ?? []),
+    ...(pod.status?.containerStatuses ?? [])
+  ]
+  for (const cs of allStatuses) {
+    const waiting = cs.state?.waiting
+    if (waiting?.reason && unrecoverableReasons.has(waiting.reason)) {
+      errors.push(
+        `container "${cs.name}": ${waiting.reason}${
+          waiting.message ? ` - ${waiting.message}` : ''
+        }`
+      )
+    }
+  }
+  return errors
+}
+
+export async function describePodFailure(podName: string): Promise<string> {
+  let pod: k8s.V1Pod
+  try {
+    pod = await readPod(podName)
+  } catch (err) {
+    return `Could not read pod ${podName} for diagnostics: ${
+      err instanceof Error ? err.message : String(err)
+    }`
+  }
+
+  const lines: string[] = []
+  const status = pod.status
+
+  if (status?.phase) {
+    lines.push(
+      `Phase: ${status.phase}${
+        status.reason ? ` (reason: ${status.reason})` : ''
+      }`
+    )
+  }
+  if (status?.message) {
+    lines.push(`Message: ${status.message}`)
+  }
+
+  for (const cond of status?.conditions ?? []) {
+    if (cond.status === 'False') {
+      lines.push(
+        `Condition ${cond.type}=False${
+          cond.reason ? ` (reason: ${cond.reason})` : ''
+        }${cond.message ? `: ${cond.message}` : ''}`
+      )
+    }
+  }
+
+  const allStatuses = [
+    ...(status?.initContainerStatuses ?? []),
+    ...(status?.containerStatuses ?? [])
+  ]
+  for (const cs of allStatuses) {
+    const waiting = cs.state?.waiting
+    if (waiting?.reason) {
+      lines.push(
+        `Container "${cs.name}" waiting: ${waiting.reason}${
+          waiting.message ? ` - ${waiting.message}` : ''
+        }`
+      )
+    }
+    const terminated = cs.state?.terminated
+    if (terminated) {
+      lines.push(
+        `Container "${cs.name}" terminated: ${
+          terminated.reason ?? 'Unknown'
+        } (exit code ${terminated.exitCode})${
+          terminated.message ? ` - ${terminated.message}` : ''
+        }`
+      )
+    }
+  }
+
+  lines.push(...(await describePodWarningEvents(podName)))
+
+  if (!lines.length) {
+    return `No additional diagnostic information available for pod ${podName}`
+  }
+  return lines.join('\n')
+}
+
+async function describePodWarningEvents(podName: string): Promise<string[]> {
+  let items: k8s.CoreV1Event[]
+  try {
+    const { body } = await k8sApi.listNamespacedEvent(
+      namespace(),
+      undefined,
+      undefined,
+      undefined,
+      `involvedObject.name=${podName}`
+    )
+    items = body.items
+  } catch (err) {
+    core.debug(
+      `Could not list events for pod ${podName} (the 'events' permission may be missing): ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    )
+    return []
+  }
+
+  const warnings = items.filter(e => e.type === 'Warning')
+  if (!warnings.length) {
+    return []
+  }
+
+  const eventTime = (e: k8s.CoreV1Event): number => {
+    const t = e.lastTimestamp ?? e.eventTime ?? e.firstTimestamp
+    return t ? new Date(t).getTime() : 0
+  }
+  warnings.sort((a, b) => eventTime(a) - eventTime(b))
+
+  const recent = warnings.slice(-MAX_DIAGNOSTIC_EVENTS)
+  const lines = recent.map(e => {
+    const count = e.count && e.count > 1 ? ` (x${e.count})` : ''
+    return `Event [Warning] ${e.reason ?? ''}${count}: ${
+      e.message ?? ''
+    }`.trim()
+  })
+  if (warnings.length > recent.length) {
+    lines.unshift(
+      `(showing ${recent.length} of ${warnings.length} warning events)`
+    )
+  }
+  return lines
+}
+
 export async function waitForPodPhases(
   podName: string,
   awaitingPhases: Set<PodPhase>,
@@ -376,22 +534,38 @@ export async function waitForPodPhases(
 ): Promise<void> {
   const backOffManager = new BackOffManager(maxTimeSeconds)
   let phase: PodPhase = PodPhase.UNKNOWN
-  try {
-    while (true) {
-      phase = await getPodPhase(podName)
-      if (awaitingPhases.has(phase)) {
-        return
-      }
-
-      if (!backOffPhases.has(phase)) {
-        throw new Error(
-          `Pod ${podName} is unhealthy with phase status ${phase}`
-        )
-      }
-      await backOffManager.backOff()
+  while (true) {
+    const pod = await readPod(podName)
+    phase = parsePodPhase(pod)
+    if (awaitingPhases.has(phase)) {
+      return
     }
-  } catch (error) {
-    throw new Error(`Pod ${podName} is unhealthy with phase status ${phase}`)
+
+    if (!backOffPhases.has(phase)) {
+      const details = await describePodFailure(podName)
+      throw new Error(
+        `Pod ${podName} is unhealthy with phase status ${phase}\n${details}`
+      )
+    }
+
+    const containerErrors = getContainerErrors(pod)
+    if (containerErrors.length > 0) {
+      const details = await describePodFailure(podName)
+      throw new Error(
+        `Pod ${podName} has unrecoverable container errors: ${containerErrors.join(
+          '; '
+        )}\n${details}`
+      )
+    }
+
+    try {
+      await backOffManager.backOff()
+    } catch (error) {
+      const details = await describePodFailure(podName)
+      throw new Error(
+        `Pod ${podName} is unhealthy: timed out after ${maxTimeSeconds}s in phase ${phase}\n${details}`
+      )
+    }
   }
 }
 
@@ -414,21 +588,24 @@ export function getPrepareJobTimeoutSeconds(): number {
   return timeoutSeconds
 }
 
-async function getPodPhase(podName: string): Promise<PodPhase> {
-  const podPhaseLookup = new Set<string>([
-    PodPhase.PENDING,
-    PodPhase.RUNNING,
-    PodPhase.SUCCEEDED,
-    PodPhase.FAILED,
-    PodPhase.UNKNOWN
-  ])
+async function readPod(podName: string): Promise<k8s.V1Pod> {
   const { body } = await k8sApi.readNamespacedPod(podName, namespace())
-  const pod = body
+  return body
+}
 
+const podPhaseLookup = new Set<string>([
+  PodPhase.PENDING,
+  PodPhase.RUNNING,
+  PodPhase.SUCCEEDED,
+  PodPhase.FAILED,
+  PodPhase.UNKNOWN
+])
+
+export function parsePodPhase(pod: k8s.V1Pod): PodPhase {
   if (!pod.status?.phase || !podPhaseLookup.has(pod.status.phase)) {
     return PodPhase.UNKNOWN
   }
-  return pod.status?.phase as PodPhase
+  return pod.status.phase as PodPhase
 }
 
 async function isJobSucceeded(jobName: string): Promise<boolean> {
