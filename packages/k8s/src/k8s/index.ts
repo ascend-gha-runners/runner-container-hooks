@@ -376,15 +376,39 @@ export const UNRECOVERABLE_WAITING_REASONS = new Set([
   'CreateContainerError'
 ])
 
+// Maximum number of Warning events to include in a pod's failure description so
+// that the GitHub Actions log is not flooded.
+const MAX_DIAGNOSTIC_EVENTS = 10
+
+// The fast-fail whitelist can be extended (not narrowed) from the environment so
+// operators can add deterministic terminal reasons without a code change. This
+// reuses the same env-var configuration pattern as the prepare-job timeout. When
+// the variable is unset, behaviour is identical to the built-in defaults.
+export function getUnrecoverableWaitingReasons(): Set<string> {
+  const extra = process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_WAITING_REASONS']
+  if (!extra) {
+    return UNRECOVERABLE_WAITING_REASONS
+  }
+  const reasons = new Set(UNRECOVERABLE_WAITING_REASONS)
+  for (const reason of extra.split(',')) {
+    const trimmed = reason.trim()
+    if (trimmed) {
+      reasons.add(trimmed)
+    }
+  }
+  return reasons
+}
+
 export function getContainerErrors(pod: k8s.V1Pod): string[] {
   const errors: string[] = []
+  const unrecoverableReasons = getUnrecoverableWaitingReasons()
   const allStatuses = [
     ...(pod.status?.initContainerStatuses ?? []),
     ...(pod.status?.containerStatuses ?? [])
   ]
   for (const cs of allStatuses) {
     const waiting = cs.state?.waiting
-    if (waiting?.reason && UNRECOVERABLE_WAITING_REASONS.has(waiting.reason)) {
+    if (waiting?.reason && unrecoverableReasons.has(waiting.reason)) {
       errors.push(
         `container "${cs.name}": ${waiting.reason}${
           waiting.message ? ` - ${waiting.message}` : ''
@@ -395,6 +419,128 @@ export function getContainerErrors(pod: k8s.V1Pod): string[] {
   return errors
 }
 
+// describePodFailure aggregates everything that might explain why a pod is not
+// healthy into a single human-readable string. It makes NO success/failure
+// judgement of its own (a terminated exitCode=0 container is just reported as
+// such) -- callers decide what is "bad". It never throws: if it cannot read the
+// pod or list events it returns/embeds a best-effort note instead, so it is safe
+// to call from any error path.
+export async function describePodFailure(podName: string): Promise<string> {
+  let pod: k8s.V1Pod
+  try {
+    pod = await readPod(podName)
+  } catch (err) {
+    return `Could not read pod ${podName} for diagnostics: ${
+      err instanceof Error ? err.message : String(err)
+    }`
+  }
+
+  const lines: string[] = []
+  const status = pod.status
+
+  if (status?.phase) {
+    lines.push(
+      `Phase: ${status.phase}${
+        status.reason ? ` (reason: ${status.reason})` : ''
+      }`
+    )
+  }
+  if (status?.message) {
+    lines.push(`Message: ${status.message}`)
+  }
+
+  // Surface conditions that are blocking readiness, e.g. PodScheduled=False
+  // which is the only place a FailedScheduling shows up on the pod itself.
+  for (const cond of status?.conditions ?? []) {
+    if (cond.status === 'False') {
+      lines.push(
+        `Condition ${cond.type}=False${
+          cond.reason ? ` (reason: ${cond.reason})` : ''
+        }${cond.message ? `: ${cond.message}` : ''}`
+      )
+    }
+  }
+
+  const allStatuses = [
+    ...(status?.initContainerStatuses ?? []),
+    ...(status?.containerStatuses ?? [])
+  ]
+  for (const cs of allStatuses) {
+    const waiting = cs.state?.waiting
+    if (waiting?.reason) {
+      lines.push(
+        `Container "${cs.name}" waiting: ${waiting.reason}${
+          waiting.message ? ` - ${waiting.message}` : ''
+        }`
+      )
+    }
+    const terminated = cs.state?.terminated
+    if (terminated) {
+      lines.push(
+        `Container "${cs.name}" terminated: ${
+          terminated.reason ?? 'Unknown'
+        } (exit code ${terminated.exitCode})${
+          terminated.message ? ` - ${terminated.message}` : ''
+        }`
+      )
+    }
+  }
+
+  lines.push(...(await describePodWarningEvents(podName)))
+
+  if (!lines.length) {
+    return `No additional diagnostic information available for pod ${podName}`
+  }
+  return lines.join('\n')
+}
+
+// Reads the most recent Warning events for a pod. Best-effort: listing events
+// requires the optional "events" get/list permission, so any error (including
+// RBAC Forbidden) is swallowed and an empty list is returned.
+async function describePodWarningEvents(podName: string): Promise<string[]> {
+  let items: k8s.CoreV1Event[]
+  try {
+    const { body } = await k8sApi.listNamespacedEvent(
+      namespace(),
+      undefined,
+      undefined,
+      undefined,
+      `involvedObject.name=${podName}`
+    )
+    items = body.items
+  } catch (err) {
+    core.debug(
+      `Could not list events for pod ${podName} (the 'events' permission may be missing): ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    )
+    return []
+  }
+
+  const warnings = items.filter(e => e.type === 'Warning')
+  if (!warnings.length) {
+    return []
+  }
+
+  const eventTime = (e: k8s.CoreV1Event): number => {
+    const t = e.lastTimestamp ?? e.eventTime ?? e.firstTimestamp
+    return t ? new Date(t).getTime() : 0
+  }
+  warnings.sort((a, b) => eventTime(a) - eventTime(b))
+
+  const recent = warnings.slice(-MAX_DIAGNOSTIC_EVENTS)
+  const lines = recent.map(e => {
+    const count = e.count && e.count > 1 ? ` (x${e.count})` : ''
+    return `Event [Warning] ${e.reason ?? ''}${count}: ${e.message ?? ''}`.trim()
+  })
+  if (warnings.length > recent.length) {
+    lines.unshift(
+      `(showing ${recent.length} of ${warnings.length} warning events)`
+    )
+  }
+  return lines
+}
+
 export async function waitForPodPhases(
   podName: string,
   awaitingPhases: Set<PodPhase>,
@@ -403,37 +549,48 @@ export async function waitForPodPhases(
 ): Promise<void> {
   const backOffManager = new BackOffManager(maxTimeSeconds)
   let phase: PodPhase = PodPhase.UNKNOWN
-  try {
-    while (true) {
-      const pod = await readPod(podName)
-      phase = parsePodPhase(pod)
-      if (awaitingPhases.has(phase)) {
-        return
-      }
-
-      if (!backOffPhases.has(phase)) {
-        throw new Error(
-          `Pod ${podName} is unhealthy with phase status ${phase}`
-        )
-      }
-
-      const containerErrors = getContainerErrors(pod)
-      if (containerErrors.length > 0) {
-        throw new Error(
-          `Pod ${podName} has unrecoverable container errors: ${containerErrors.join(
-            '; '
-          )}`
-        )
-      }
-
-      await backOffManager.backOff()
+  while (true) {
+    const pod = await readPod(podName)
+    phase = parsePodPhase(pod)
+    if (awaitingPhases.has(phase)) {
+      return
     }
-  } catch (error) {
-    throw new Error(
-      `Pod ${podName} is unhealthy with phase status ${phase}: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    )
+
+    // The pod reached a phase we are not willing to keep waiting on
+    // (a terminal/unhealthy phase). Attach full diagnostics and stop.
+    if (!backOffPhases.has(phase)) {
+      const details = await describePodFailure(podName)
+      throw new Error(
+        `Pod ${podName} is unhealthy with phase status ${phase}\n${details}`
+      )
+    }
+
+    // Still in a back-off phase, but a container hit a deterministic terminal
+    // error (e.g. ImagePullBackOff) -- fail fast with diagnostics instead of
+    // waiting out the full timeout.
+    const containerErrors = getContainerErrors(pod)
+    if (containerErrors.length > 0) {
+      const details = await describePodFailure(podName)
+      throw new Error(
+        `Pod ${podName} has unrecoverable container errors: ${containerErrors.join(
+          '; '
+        )}\n${details}`
+      )
+    }
+
+    try {
+      await backOffManager.backOff()
+    } catch (error) {
+      // BackOffManager throws "backoff timeout" when maxTimeSeconds is exceeded.
+      // Don't surface that bare message: collect diagnostics first so the user
+      // can see WHY the pod never became ready. This is the safest improvement
+      // -- it only runs when we were going to fail anyway and changes no
+      // success/failure decision.
+      const details = await describePodFailure(podName)
+      throw new Error(
+        `Pod ${podName} is unhealthy: timed out after ${maxTimeSeconds}s in phase ${phase}\n${details}`
+      )
+    }
   }
 }
 
