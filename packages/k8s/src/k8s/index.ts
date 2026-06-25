@@ -836,7 +836,9 @@ async function describePodWarningEvents(podName: string): Promise<string[]> {
   const recent = warnings.slice(-MAX_DIAGNOSTIC_EVENTS)
   const lines = recent.map(e => {
     const count = e.count && e.count > 1 ? ` (x${e.count})` : ''
-    return `Event [Warning] ${e.reason ?? ''}${count}: ${e.message ?? ''}`.trim()
+    return `Event [Warning] ${e.reason ?? ''}${count}: ${
+      e.message ?? ''
+    }`.trim()
   })
   if (warnings.length > recent.length) {
     lines.unshift(
