@@ -1,4 +1,5 @@
 import * as core from '@actions/core'
+import * as fs from 'fs'
 import * as path from 'path'
 import { spawn } from 'child_process'
 import * as k8s from '@kubernetes/client-node'
@@ -1051,12 +1052,26 @@ export function namespace(): string {
   }
 
   const context = kc.getContexts().find(ctx => ctx.namespace)
-  if (!context?.namespace) {
-    throw new Error(
-      'Failed to determine namespace, falling back to `default`. Namespace should be set in context, or in env variable "ACTIONS_RUNNER_KUBERNETES_NAMESPACE"'
-    )
+  if (context?.namespace) {
+    return context.namespace
   }
-  return context.namespace
+
+  // When running in-cluster the kubeconfig context has no namespace field;
+  // read it from the mounted ServiceAccount file instead.
+  const saNamespaceFile =
+    '/var/run/secrets/kubernetes.io/serviceaccount/namespace'
+  try {
+    const ns = fs.readFileSync(saNamespaceFile, 'utf8').trim()
+    if (ns) {
+      return ns
+    }
+  } catch {
+    // not running in-cluster, fall through to error
+  }
+
+  throw new Error(
+    'Failed to determine namespace. Set the ACTIONS_RUNNER_KUBERNETES_NAMESPACE environment variable or ensure the kubeconfig context includes a namespace.'
+  )
 }
 
 class BackOffManager {
