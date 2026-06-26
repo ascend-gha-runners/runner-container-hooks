@@ -806,14 +806,11 @@ export async function describePodFailure(podName: string): Promise<string> {
 async function describePodWarningEvents(podName: string): Promise<string[]> {
   let items: k8s.CoreV1Event[]
   try {
-    const { body } = await k8sApi.listNamespacedEvent(
-      namespace(),
-      undefined,
-      undefined,
-      undefined,
-      `involvedObject.name=${podName}`
-    )
-    items = body.items
+    const result = await k8sApi.listNamespacedEvent({
+      namespace: namespace(),
+      fieldSelector: `involvedObject.name=${podName}`
+    })
+    items = result.items
   } catch (err) {
     core.debug(
       `Could not list events for pod ${podName} (the 'events' permission may be missing): ${
