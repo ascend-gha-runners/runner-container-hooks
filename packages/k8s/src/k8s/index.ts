@@ -774,14 +774,19 @@ export async function describePodFailure(podName: string): Promise<string> {
   for (const cs of allStatuses) {
     const waiting = cs.state?.waiting
     if (waiting?.reason) {
-      lines.push(
-        `Container "${cs.name}" waiting: ${waiting.reason}${
-          waiting.message ? ` - ${waiting.message}` : ''
-        }`
-      )
+      // Skip reasons already surfaced by getContainerErrors() to avoid
+      // duplicating the same message in the caller's error string.
+      if (!UNRECOVERABLE_WAITING_REASONS.has(waiting.reason)) {
+        lines.push(
+          `Container "${cs.name}" waiting: ${waiting.reason}${
+            waiting.message ? ` - ${waiting.message}` : ''
+          }`
+        )
+      }
     }
     const terminated = cs.state?.terminated
-    if (terminated) {
+    // Only surface non-zero exits; exit 0 (e.g. fs-init Completed) is noise.
+    if (terminated && terminated.exitCode !== 0) {
       lines.push(
         `Container "${cs.name}" terminated: ${
           terminated.reason ?? 'Unknown'
