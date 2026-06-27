@@ -682,6 +682,28 @@ export const UNRECOVERABLE_WAITING_REASONS = new Set([
   'CreateContainerError'
 ])
 
+// Pod *event* reasons (from the event stream, not container status) that
+// indicate a permanent failure the pod will never recover from on its own.
+// These surface as Warning events on the pod (visible via `kubectl describe`)
+// rather than in container.status.state.waiting.reason, so they need a separate
+// list + a separate (async) detection path.
+//
+//   - FailedMount: a volume cannot be mounted (e.g. hostPath `type: Directory`
+//     pointing at a path that does not exist on the node, missing PVC, missing
+//     Secret/ConfigMap volume). The container stays in `ContainerCreating`
+//     waiting state, which is NOT in UNRECOVERABLE_WAITING_REASONS, so without
+//     this check the hook polls until the 3600s timeout.
+//   - FailedScheduling: the scheduler cannot place the pod (insufficient
+//     cpu/memory/gpu, node selector / affinity mismatch, no matching nodes).
+//     The pod stays Pending with PodScheduled=False forever.
+//   - FailedBinding: a PVC could not be bound (no matching PV, storage class
+//     misconfiguration). Usually paired with FailedMount once the pod retries.
+export const UNRECOVERABLE_EVENT_REASONS = new Set([
+  'FailedMount',
+  'FailedScheduling',
+  'FailedBinding'
+])
+
 // Maximum number of Warning events to include in a pod's failure description so
 // that the GitHub Actions log is not flooded.
 const MAX_DIAGNOSTIC_EVENTS = 10
@@ -696,6 +718,24 @@ export function getUnrecoverableWaitingReasons(): Set<string> {
     return UNRECOVERABLE_WAITING_REASONS
   }
   const reasons = new Set(UNRECOVERABLE_WAITING_REASONS)
+  for (const reason of extra.split(',')) {
+    const trimmed = reason.trim()
+    if (trimmed) {
+      reasons.add(trimmed)
+    }
+  }
+  return reasons
+}
+
+// Mirrors getUnrecoverableWaitingReasons() but for pod *event* reasons. The
+// env var ACTIONS_RUNNER_K8S_UNRECOVERABLE_EVENT_REASONS adds to (never removes
+// from) the built-in UNRECOVERABLE_EVENT_REASONS set.
+export function getUnrecoverableEventReasons(): Set<string> {
+  const extra = process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_EVENT_REASONS']
+  if (!extra) {
+    return UNRECOVERABLE_EVENT_REASONS
+  }
+  const reasons = new Set(UNRECOVERABLE_EVENT_REASONS)
   for (const reason of extra.split(',')) {
     const trimmed = reason.trim()
     if (trimmed) {
@@ -720,6 +760,53 @@ export function getContainerErrors(pod: k8s.V1Pod): string[] {
       const detail = waiting.message ? `    ${waiting.message}` : ''
       errors.push(detail ? `${reason}\n${detail}` : reason)
     }
+  }
+  return errors
+}
+
+// Inspects the pod's Warning events for reasons in UNRECOVERABLE_EVENT_REASONS
+// (e.g. FailedMount when a hostPath directory does not exist). Unlike container
+// waiting reasons, these appear only in the event stream, so a separate API
+// call is required. Best-effort: if events cannot be listed (e.g. the optional
+// 'events' RBAC permission is missing) it returns an empty list instead of
+// blocking fast-fail detection of container-level errors. Deduplicates by
+// reason so a repeatedly retried FailedMount is reported once.
+export async function getPodEventErrors(podName: string): Promise<string[]> {
+  const unrecoverableReasons = getUnrecoverableEventReasons()
+  if (unrecoverableReasons.size === 0) {
+    return []
+  }
+
+  let items: k8s.CoreV1Event[]
+  try {
+    const result = await k8sApi.listNamespacedEvent({
+      namespace: namespace(),
+      fieldSelector: `involvedObject.name=${podName}`
+    })
+    items = result.items
+  } catch (err) {
+    core.debug(
+      `Could not list events for pod ${podName} during fast-fail check: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    )
+    return []
+  }
+
+  const errors: string[] = []
+  const seenReasons = new Set<string>()
+  for (const e of items) {
+    if (e.type !== 'Warning' || !e.reason || !unrecoverableReasons.has(e.reason)) {
+      continue
+    }
+    if (seenReasons.has(e.reason)) {
+      continue
+    }
+    seenReasons.add(e.reason)
+    const count = e.count && e.count > 1 ? ` (x${e.count})` : ''
+    const reason = `  ✗ event: ${e.reason}${count}`
+    const detail = e.message ? `    ${e.message}` : ''
+    errors.push(detail ? `${reason}\n${detail}` : reason)
   }
   return errors
 }
@@ -878,10 +965,17 @@ export async function waitForPodPhases(
     // error (e.g. ImagePullBackOff) -- fail fast with diagnostics instead of
     // waiting out the full timeout.
     const containerErrors = getContainerErrors(pod)
-    if (containerErrors.length > 0) {
+    // Also check the pod's Warning events for unrecoverable event reasons such
+    // as FailedMount (hostPath directory missing). These never show up in
+    // container.status.state.waiting.reason -- the container stays in
+    // ContainerCreating -- so without this check the hook would poll until the
+    // 3600s timeout.
+    const eventErrors = await getPodEventErrors(podName)
+    if (containerErrors.length > 0 || eventErrors.length > 0) {
+      const allErrors = [...containerErrors, ...eventErrors]
       const details = await describePodFailure(podName)
       throw new Error(
-        `Pod ${podName} has unrecoverable container errors:\n${containerErrors.join('\n')}\n${'─'.repeat(60)}\n${details}`
+        `Pod ${podName} has unrecoverable errors:\n${allErrors.join('\n')}\n${'─'.repeat(60)}\n${details}`
       )
     }
 

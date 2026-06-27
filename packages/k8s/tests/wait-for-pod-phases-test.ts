@@ -2,8 +2,11 @@ import * as k8s from '@kubernetes/client-node'
 import {
   describePodFailure,
   getContainerErrors,
+  getPodEventErrors,
+  getUnrecoverableEventReasons,
   getUnrecoverableWaitingReasons,
   parsePodPhase,
+  UNRECOVERABLE_EVENT_REASONS,
   UNRECOVERABLE_WAITING_REASONS,
   waitForPodPhases
 } from '../src/k8s'
@@ -36,6 +39,30 @@ function waitingContainer(
     name,
     state: { waiting: { reason, message } }
   } as k8s.V1ContainerStatus
+}
+
+// Build a Warning event with the fields getPodEventErrors() inspects.
+function buildEvent(
+  reason: string,
+  message: string,
+  opts: { type?: string; count?: number } = {}
+): k8s.CoreV1Event {
+  return {
+    type: opts.type ?? 'Warning',
+    reason,
+    message,
+    count: opts.count,
+    lastTimestamp: new Date('2026-01-01T00:00:00Z')
+  } as k8s.CoreV1Event
+}
+
+// @kubernetes/client-node 1.x object-style API returns the object directly
+// (not wrapped in { body }), so mocks must do the same.
+function podResult(pod: k8s.V1Pod): never {
+  return pod as never
+}
+function eventResult(items: k8s.CoreV1Event[]): never {
+  return { items } as never
 }
 
 describe('parsePodPhase', () => {
@@ -74,11 +101,13 @@ describe('getContainerErrors', () => {
       const pod = buildPod(PodPhase.PENDING, {
         containerStatuses: [waitingContainer('job', reason)]
       })
-      expect(getContainerErrors(pod)).toEqual([`container "job": ${reason}`])
+      expect(getContainerErrors(pod)).toEqual([
+        `  ✗ container "job": ${reason}`
+      ])
     }
   })
 
-  it('includes the waiting message when present', () => {
+  it('includes the waiting message as an indented second line', () => {
     const pod = buildPod(PodPhase.PENDING, {
       containerStatuses: [
         waitingContainer(
@@ -89,7 +118,7 @@ describe('getContainerErrors', () => {
       ]
     })
     expect(getContainerErrors(pod)).toEqual([
-      'container "job": ErrImagePull - Back-off pulling image "does-not-exist:latest"'
+      '  ✗ container "job": ErrImagePull\n    Back-off pulling image "does-not-exist:latest"'
     ])
   })
 
@@ -99,8 +128,8 @@ describe('getContainerErrors', () => {
       containerStatuses: [waitingContainer('job', 'CreateContainerError')]
     })
     expect(getContainerErrors(pod)).toEqual([
-      'container "init": ImagePullBackOff',
-      'container "job": CreateContainerError'
+      '  ✗ container "init": ImagePullBackOff',
+      '  ✗ container "job": CreateContainerError'
     ])
   })
 
@@ -112,77 +141,104 @@ describe('getContainerErrors', () => {
       ]
     })
     expect(getContainerErrors(pod)).toEqual([
-      'container "bad": InvalidImageName'
+      '  ✗ container "bad": InvalidImageName'
     ])
   })
 })
 
-describe('waitForPodPhases', () => {
-  let readSpy: jest.SpyInstance
+describe('getPodEventErrors', () => {
   let eventSpy: jest.SpyInstance
 
   beforeEach(() => {
     process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
-    readSpy = jest.spyOn(k8s.CoreV1Api.prototype, 'readNamespacedPod')
-    // waitForPodPhases now calls describePodFailure on its failure paths, which
-    // lists events. Stub it out so the tests never hit a real cluster.
     eventSpy = jest.spyOn(k8s.CoreV1Api.prototype, 'listNamespacedEvent')
-    eventSpy.mockResolvedValue({ body: { items: [] } } as never)
   })
 
   afterEach(() => {
     jest.restoreAllMocks()
     delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+    delete process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_EVENT_REASONS']
   })
 
-  it('returns once the pod reaches an awaited phase', async () => {
-    readSpy.mockResolvedValue({ body: buildPod(PodPhase.RUNNING) } as never)
-
-    await expect(
-      waitForPodPhases(
-        'my-pod',
-        new Set([PodPhase.RUNNING]),
-        new Set([PodPhase.PENDING])
-      )
-    ).resolves.toBeUndefined()
+  it('returns no errors when there are no warning events', async () => {
+    eventSpy.mockResolvedValue(eventResult([]))
+    expect(await getPodEventErrors('my-pod')).toEqual([])
   })
 
-  it('surfaces unrecoverable container errors in the thrown message', async () => {
-    readSpy.mockResolvedValue({
-      body: buildPod(PodPhase.PENDING, {
-        containerStatuses: [
-          waitingContainer(
-            'job',
-            'ImagePullBackOff',
-            'Back-off pulling image "nope:latest"'
-          )
-        ]
-      })
-    } as never)
-
-    await expect(
-      waitForPodPhases(
-        'my-pod',
-        new Set([PodPhase.RUNNING]),
-        new Set([PodPhase.PENDING])
-      )
-    ).rejects.toThrow(
-      'container "job": ImagePullBackOff - Back-off pulling image "nope:latest"'
+  it('returns no errors for warning events whose reason is not unrecoverable', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('Unhealthy', 'Liveness probe failed'),
+        buildEvent('BackOff', 'container restart back-off')
+      ])
     )
+    expect(await getPodEventErrors('my-pod')).toEqual([])
   })
 
-  it('throws with the phase when the pod is in a non-backoff phase', async () => {
-    readSpy.mockResolvedValue({ body: buildPod(PodPhase.FAILED) } as never)
+  it('detects FailedMount (the hostPath Directory missing case)', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent(
+          'FailedMount',
+          'Unable to attach or mount volume "bad-hostpath": mount path "/this/path/does/not/exist" does not exist',
+          { count: 3 }
+        )
+      ])
+    )
+    expect(await getPodEventErrors('my-pod')).toEqual([
+      '  ✗ event: FailedMount (x3)\n    Unable to attach or mount volume "bad-hostpath": mount path "/this/path/does/not/exist" does not exist'
+    ])
+  })
 
-    // The message is no longer double-wrapped: it states the phase once and is
-    // followed by the diagnostic block from describePodFailure.
-    await expect(
-      waitForPodPhases(
-        'my-pod',
-        new Set([PodPhase.RUNNING]),
-        new Set([PodPhase.PENDING])
-      )
-    ).rejects.toThrow('Pod my-pod is unhealthy with phase status Failed')
+  it('detects every unrecoverable event reason', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedScheduling', '0/1 nodes are available'),
+        buildEvent('FailedBinding', 'no persistent volumes available'),
+        buildEvent('FailedMount', 'volume not found')
+      ])
+    )
+    expect(await getPodEventErrors('my-pod')).toEqual([
+      '  ✗ event: FailedScheduling\n    0/1 nodes are available',
+      '  ✗ event: FailedBinding\n    no persistent volumes available',
+      '  ✗ event: FailedMount\n    volume not found'
+    ])
+  })
+
+  it('ignores Normal-type events even if the reason matches', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([buildEvent('FailedMount', 'volume not found', { type: 'Normal' })])
+    )
+    expect(await getPodEventErrors('my-pod')).toEqual([])
+  })
+
+  it('deduplicates events that share the same reason', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedMount', 'first attempt', { count: 1 }),
+        buildEvent('FailedMount', 'second attempt', { count: 5 })
+      ])
+    )
+    // Only the first occurrence is kept.
+    expect(await getPodEventErrors('my-pod')).toEqual([
+      '  ✗ event: FailedMount\n    first attempt'
+    ])
+  })
+
+  it('honors extra reasons from the env var', async () => {
+    process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_EVENT_REASONS'] =
+      'FailedPreStopHook'
+    eventSpy.mockResolvedValue(
+      eventResult([buildEvent('FailedPreStopHook', 'hook failed')])
+    )
+    expect(await getPodEventErrors('my-pod')).toEqual([
+      '  ✗ event: FailedPreStopHook\n    hook failed'
+    ])
+  })
+
+  it('degrades gracefully when listing events is forbidden', async () => {
+    eventSpy.mockRejectedValue(new Error('events is forbidden') as never)
+    expect(await getPodEventErrors('my-pod')).toEqual([])
   })
 })
 
@@ -215,8 +271,143 @@ describe('getUnrecoverableWaitingReasons', () => {
       containerStatuses: [waitingContainer('job', 'CrashLoopBackOff')]
     })
     expect(getContainerErrors(pod)).toEqual([
-      'container "job": CrashLoopBackOff'
+      '  ✗ container "job": CrashLoopBackOff'
     ])
+  })
+})
+
+describe('getUnrecoverableEventReasons', () => {
+  afterEach(() => {
+    delete process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_EVENT_REASONS']
+  })
+
+  it('returns the built-in defaults when the env var is unset', () => {
+    expect(getUnrecoverableEventReasons()).toEqual(UNRECOVERABLE_EVENT_REASONS)
+  })
+
+  it('adds extra reasons from the env var without dropping the defaults', () => {
+    process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_EVENT_REASONS'] =
+      'FailedPreStopHook, FailedPostStartHook'
+    const reasons = getUnrecoverableEventReasons()
+    for (const builtin of Array.from(UNRECOVERABLE_EVENT_REASONS)) {
+      expect(reasons.has(builtin)).toBe(true)
+    }
+    expect(reasons.has('FailedPreStopHook')).toBe(true)
+    expect(reasons.has('FailedPostStartHook')).toBe(true)
+  })
+})
+
+describe('waitForPodPhases', () => {
+  let readSpy: jest.SpyInstance
+  let eventSpy: jest.SpyInstance
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    readSpy = jest.spyOn(k8s.CoreV1Api.prototype, 'readNamespacedPod')
+    // waitForPodPhases now calls getPodEventErrors (lists events) on every poll
+    // for fast-fail detection, and describePodFailure on failure paths (also
+    // lists events). Stub it out so the tests never hit a real cluster.
+    eventSpy = jest.spyOn(k8s.CoreV1Api.prototype, 'listNamespacedEvent')
+    eventSpy.mockResolvedValue(eventResult([]))
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('returns once the pod reaches an awaited phase', async () => {
+    readSpy.mockResolvedValue(podResult(buildPod(PodPhase.RUNNING)))
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).resolves.toBeUndefined()
+  })
+
+  it('surfaces unrecoverable container errors in the thrown message', async () => {
+    readSpy.mockResolvedValue(
+      podResult(
+        buildPod(PodPhase.PENDING, {
+          containerStatuses: [
+            waitingContainer(
+              'job',
+              'ImagePullBackOff',
+              'Back-off pulling image "nope:latest"'
+            )
+          ]
+        })
+      )
+    )
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).rejects.toThrow('Pod my-pod has unrecoverable errors')
+  })
+
+  it('fast-fails on FailedMount events instead of polling to timeout', async () => {
+    // Container is in ContainerCreating (recoverable waiting reason), but the
+    // pod has a FailedMount Warning event -- this is the hostPath-missing case.
+    readSpy.mockResolvedValue(
+      podResult(
+        buildPod(PodPhase.PENDING, {
+          containerStatuses: [waitingContainer('job', 'ContainerCreating')]
+        })
+      )
+    )
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent(
+          'FailedMount',
+          'mount path "/this/path/does/not/exist" does not exist',
+          { count: 4 }
+        )
+      ])
+    )
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).rejects.toThrow(
+      /has unrecoverable errors:[\s\S]*event: FailedMount \(x4\)/
+    )
+  })
+
+  it('fast-fails on FailedScheduling events', async () => {
+    readSpy.mockResolvedValue(podResult(buildPod(PodPhase.PENDING)))
+    eventSpy.mockResolvedValue(
+      eventResult([buildEvent('FailedScheduling', '0/1 nodes are available')])
+    )
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).rejects.toThrow(/event: FailedScheduling[\s\S]*0\/1 nodes are available/)
+  })
+
+  it('throws with the phase when the pod is in a non-backoff phase', async () => {
+    readSpy.mockResolvedValue(podResult(buildPod(PodPhase.FAILED)))
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).rejects.toThrow('Pod my-pod is unhealthy (phase: Failed)')
   })
 })
 
@@ -229,7 +420,7 @@ describe('describePodFailure', () => {
     readSpy = jest.spyOn(k8s.CoreV1Api.prototype, 'readNamespacedPod')
     eventSpy = jest.spyOn(k8s.CoreV1Api.prototype, 'listNamespacedEvent')
     // Default: no events. Individual tests override this.
-    eventSpy.mockResolvedValue({ body: { items: [] } } as never)
+    eventSpy.mockResolvedValue(eventResult([]))
   })
 
   afterEach(() => {
@@ -238,8 +429,8 @@ describe('describePodFailure', () => {
   })
 
   it('reports phase, failing conditions and terminated containers', async () => {
-    readSpy.mockResolvedValue({
-      body: {
+    readSpy.mockResolvedValue(
+      podResult({
         status: {
           phase: PodPhase.FAILED,
           reason: 'Evicted',
@@ -261,63 +452,59 @@ describe('describePodFailure', () => {
             }
           ]
         }
-      }
-    } as never)
+      } as k8s.V1Pod)
+    )
 
     const description = await describePodFailure('my-pod')
-    expect(description).toContain('Phase: Failed (reason: Evicted)')
+    expect(description).toContain('Pod status: Failed (Evicted)')
+    expect(description).toContain('The node was low on resource: memory')
     expect(description).toContain(
-      'Message: The node was low on resource: memory'
+      '✗ PodScheduled=False (Unschedulable): no nodes available'
     )
     expect(description).toContain(
-      'Condition PodScheduled=False (reason: Unschedulable): no nodes available'
-    )
-    expect(description).toContain(
-      'Container "job" terminated: OOMKilled (exit code 137)'
+      '✗ container "job" terminated: OOMKilled (exit code 137)'
     )
   })
 
   it('includes recent Warning events and skips Normal ones', async () => {
-    readSpy.mockResolvedValue({
-      body: { status: { phase: PodPhase.PENDING } }
-    } as never)
-    eventSpy.mockResolvedValue({
-      body: {
-        items: [
-          {
-            type: 'Normal',
-            reason: 'Scheduled',
-            message: 'assigned',
-            lastTimestamp: new Date('2026-01-01T00:00:00Z')
-          },
-          {
-            type: 'Warning',
-            reason: 'FailedScheduling',
-            message: '0/1 nodes are available',
-            count: 3,
-            lastTimestamp: new Date('2026-01-01T00:01:00Z')
-          }
-        ]
-      }
-    } as never)
+    readSpy.mockResolvedValue(
+      podResult({ status: { phase: PodPhase.PENDING } } as k8s.V1Pod)
+    )
+    eventSpy.mockResolvedValue(
+      eventResult([
+        {
+          type: 'Normal',
+          reason: 'Scheduled',
+          message: 'assigned',
+          lastTimestamp: new Date('2026-01-01T00:00:00Z')
+        } as k8s.CoreV1Event,
+        {
+          type: 'Warning',
+          reason: 'FailedScheduling',
+          message: '0/1 nodes are available',
+          count: 3,
+          lastTimestamp: new Date('2026-01-01T00:01:00Z')
+        } as k8s.CoreV1Event
+      ])
+    )
 
     const description = await describePodFailure('my-pod')
     expect(description).toContain(
-      'Event [Warning] FailedScheduling (x3): 0/1 nodes are available'
+      '[FailedScheduling] (x3) 0/1 nodes are available'
     )
-    expect(description).not.toContain('Scheduled')
+    expect(description).not.toContain('[Scheduled]')
   })
 
   it('degrades gracefully when listing events is forbidden', async () => {
-    readSpy.mockResolvedValue({
-      body: { status: { phase: PodPhase.PENDING } }
-    } as never)
+    readSpy.mockResolvedValue(
+      podResult({ status: { phase: PodPhase.PENDING } } as k8s.V1Pod)
+    )
     eventSpy.mockRejectedValue(new Error('events is forbidden') as never)
 
     const description = await describePodFailure('my-pod')
-    expect(description).toContain('Phase: Pending')
+    expect(description).toContain('Pod status: Pending')
     // No throw, and no event lines.
-    expect(description).not.toContain('Event [Warning]')
+    expect(description).not.toContain('[Warning]')
   })
 
   it('never throws when the pod cannot be read', async () => {
