@@ -715,11 +715,10 @@ export function getContainerErrors(pod: k8s.V1Pod): string[] {
   for (const cs of allStatuses) {
     const waiting = cs.state?.waiting
     if (waiting?.reason && unrecoverableReasons.has(waiting.reason)) {
-      errors.push(
-        `container "${cs.name}": ${waiting.reason}${
-          waiting.message ? ` - ${waiting.message}` : ''
-        }`
-      )
+      // Format as two indented lines: reason on first, message detail on second
+      const reason = `  ✗ container "${cs.name}": ${waiting.reason}`
+      const detail = waiting.message ? `    ${waiting.message}` : ''
+      errors.push(detail ? `${reason}\n${detail}` : reason)
     }
   }
   return errors
@@ -741,68 +740,70 @@ export async function describePodFailure(podName: string): Promise<string> {
     }`
   }
 
-  const lines: string[] = []
+  const sections: string[] = []
   const status = pod.status
 
-  if (status?.phase) {
-    lines.push(
-      `Phase: ${status.phase}${
-        status.reason ? ` (reason: ${status.reason})` : ''
-      }`
-    )
-  }
+  // --- Pod-level status ---
+  const podLines: string[] = []
+  const phaseLabel = status?.phase
+    ? `${status.phase}${status.reason ? ` (${status.reason})` : ''}`
+    : 'Unknown'
+  podLines.push(`Pod status: ${phaseLabel}`)
   if (status?.message) {
-    lines.push(`Message: ${status.message}`)
+    podLines.push(`  ${status.message}`)
   }
 
-  // Surface conditions that are blocking readiness, e.g. PodScheduled=False
-  // which is the only place a FailedScheduling shows up on the pod itself.
+  // Surface conditions that are False (e.g. PodScheduled=False from FailedScheduling)
   for (const cond of status?.conditions ?? []) {
     if (cond.status === 'False') {
-      lines.push(
-        `Condition ${cond.type}=False${
-          cond.reason ? ` (reason: ${cond.reason})` : ''
-        }${cond.message ? `: ${cond.message}` : ''}`
-      )
+      const reason = cond.reason ? ` (${cond.reason})` : ''
+      const msg = cond.message ? `: ${cond.message}` : ''
+      podLines.push(`  ✗ ${cond.type}=False${reason}${msg}`)
     }
   }
+  sections.push(podLines.join('\n'))
 
+  // --- Container-level status (non-zero exits and non-unrecoverable waits) ---
+  const unrecoverableReasons = getUnrecoverableWaitingReasons()
   const allStatuses = [
     ...(status?.initContainerStatuses ?? []),
     ...(status?.containerStatuses ?? [])
   ]
+  const containerLines: string[] = []
   for (const cs of allStatuses) {
     const waiting = cs.state?.waiting
     if (waiting?.reason) {
-      // Skip reasons already surfaced by getContainerErrors() to avoid
-      // duplicating the same message in the caller's error string.
-      if (!UNRECOVERABLE_WAITING_REASONS.has(waiting.reason)) {
-        lines.push(
-          `Container "${cs.name}" waiting: ${waiting.reason}${
-            waiting.message ? ` - ${waiting.message}` : ''
-          }`
-        )
+      // Skip reasons already surfaced by getContainerErrors() in the caller's
+      // first line to avoid printing the same error twice.
+      if (!unrecoverableReasons.has(waiting.reason)) {
+        const msg = waiting.message ? `\n    ${waiting.message}` : ''
+        containerLines.push(`  ✗ container "${cs.name}" waiting: ${waiting.reason}${msg}`)
       }
     }
     const terminated = cs.state?.terminated
     // Only surface non-zero exits; exit 0 (e.g. fs-init Completed) is noise.
     if (terminated && terminated.exitCode !== 0) {
-      lines.push(
-        `Container "${cs.name}" terminated: ${
-          terminated.reason ?? 'Unknown'
-        } (exit code ${terminated.exitCode})${
-          terminated.message ? ` - ${terminated.message}` : ''
-        }`
+      const reason = terminated.reason ?? 'Unknown'
+      const msg = terminated.message ? `\n    ${terminated.message}` : ''
+      containerLines.push(
+        `  ✗ container "${cs.name}" terminated: ${reason} (exit code ${terminated.exitCode})${msg}`
       )
     }
   }
+  if (containerLines.length) {
+    sections.push(`Container details:\n${containerLines.join('\n')}`)
+  }
 
-  lines.push(...(await describePodWarningEvents(podName)))
+  // --- Warning events ---
+  const eventLines = await describePodWarningEvents(podName)
+  if (eventLines.length) {
+    sections.push(`Recent warning events:\n${eventLines.join('\n')}`)
+  }
 
-  if (!lines.length) {
+  if (!sections.length) {
     return `No additional diagnostic information available for pod ${podName}`
   }
-  return lines.join('\n')
+  return sections.join('\n\n')
 }
 
 // Reads the most recent Warning events for a pod. Best-effort: listing events
@@ -839,13 +840,11 @@ async function describePodWarningEvents(podName: string): Promise<string[]> {
   const recent = warnings.slice(-MAX_DIAGNOSTIC_EVENTS)
   const lines = recent.map(e => {
     const count = e.count && e.count > 1 ? ` (x${e.count})` : ''
-    return `Event [Warning] ${e.reason ?? ''}${count}: ${
-      e.message ?? ''
-    }`.trim()
+    return `  [${e.reason ?? 'Warning'}]${count} ${e.message ?? ''}`.trimEnd()
   })
   if (warnings.length > recent.length) {
     lines.unshift(
-      `(showing ${recent.length} of ${warnings.length} warning events)`
+      `  (showing ${recent.length} of ${warnings.length} warning events)`
     )
   }
   return lines
@@ -871,7 +870,7 @@ export async function waitForPodPhases(
     if (!backOffPhases.has(phase)) {
       const details = await describePodFailure(podName)
       throw new Error(
-        `Pod ${podName} is unhealthy with phase status ${phase}\n${details}`
+        `Pod ${podName} is unhealthy (phase: ${phase})\n${'─'.repeat(60)}\n${details}`
       )
     }
 
@@ -882,9 +881,7 @@ export async function waitForPodPhases(
     if (containerErrors.length > 0) {
       const details = await describePodFailure(podName)
       throw new Error(
-        `Pod ${podName} has unrecoverable container errors: ${containerErrors.join(
-          '; '
-        )}\n${details}`
+        `Pod ${podName} has unrecoverable container errors:\n${containerErrors.join('\n')}\n${'─'.repeat(60)}\n${details}`
       )
     }
 
@@ -893,12 +890,10 @@ export async function waitForPodPhases(
     } catch (error) {
       // BackOffManager throws "backoff timeout" when maxTimeSeconds is exceeded.
       // Don't surface that bare message: collect diagnostics first so the user
-      // can see WHY the pod never became ready. This is the safest improvement
-      // -- it only runs when we were going to fail anyway and changes no
-      // success/failure decision.
+      // can see WHY the pod never became ready.
       const details = await describePodFailure(podName)
       throw new Error(
-        `Pod ${podName} is unhealthy: timed out after ${maxTimeSeconds}s in phase ${phase}\n${details}`
+        `Pod ${podName} timed out after ${maxTimeSeconds}s (phase: ${phase})\n${'─'.repeat(60)}\n${details}`
       )
     }
   }
