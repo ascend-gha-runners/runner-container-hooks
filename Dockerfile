@@ -11,3 +11,4 @@ FROM ghcr.io/actions/actions-runner:2.334.0
 COPY --from=runner_builder /app/packages/k8s/dist/index.js /home/runner/k8s/index.js
 
 USER runner
+

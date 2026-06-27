@@ -112,7 +112,11 @@ export async function prepareJob(
     )
   } catch (err) {
     await prunePods()
-    throw new Error(`pod failed to come online with error: ${err}`)
+    // Unwrap nested "Error: " prefix so the message renders as:
+    //   pod failed to come online:
+    //   <detail from waitForPodPhases, already formatted with sections>
+    const detail = err instanceof Error ? err.message : String(err)
+    throw new Error(`pod failed to come online:\n${detail}`)
   }
 
   await execCpToPod(createdPod.metadata.name, runnerWorkspace, '/__w')
