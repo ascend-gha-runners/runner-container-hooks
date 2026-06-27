@@ -92,7 +92,7 @@ export async function prepareJob(
     //     spec.volumes[5].name: Duplicate value: "bad-hostpath"
     // instead of the full HTTP dump.
     const raw = err instanceof Error ? err.message : String(err)
-    const msgMatch = raw.match(/"message"\s*:\s*"((?:[^"\\]|\\.)*)"/s)
+    const msgMatch = raw.match(/"message"\s*:\s*"((?:[^"\\]|\\.)*)"/)
     const detail = msgMatch
       ? msgMatch[1].replace(/\\"/g, '"').replace(/\\n/g, '\n')
       : raw
