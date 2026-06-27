@@ -100,7 +100,12 @@ export async function prepareJob(
     // Extract the Body JSON string, unescape it, and pull out "message".
     try {
       const bodyStart = raw.indexOf('Body: "')
-      const bodyEnd = raw.indexOf('"\nHeaders:')
+      // The boundary may be '"\nHeaders:' (real newline) or the literal
+      // string ends before Headers — use the last '"' before 'Headers:' as fallback
+      const headersIdx = raw.indexOf('Headers:')
+      const bodyEnd = headersIdx !== -1
+        ? raw.lastIndexOf('"', headersIdx) - 0   // last " before Headers:
+        : raw.indexOf('"\nHeaders:')
       if (bodyStart !== -1 && bodyEnd !== -1 && bodyEnd > bodyStart) {
         const escaped = raw.substring(bodyStart + 7, bodyEnd)
         // Body uses JSON string escaping: \" → " and \\ → \
