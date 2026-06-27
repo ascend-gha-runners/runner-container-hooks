@@ -92,10 +92,30 @@ export async function prepareJob(
     //     spec.volumes[5].name: Duplicate value: "bad-hostpath"
     // instead of the full HTTP dump.
     const raw = err instanceof Error ? err.message : String(err)
-    const msgMatch = raw.match(/"message"\s*:\s*"((?:[^"\\]|\\.)*)"/)
-    const detail = msgMatch
-      ? msgMatch[1].replace(/\\"/g, '"').replace(/\\n/g, '\n')
-      : raw
+    let detail = raw
+    // The k8s HttpException message is a multi-line dump:
+    //   HTTP-Code: 422
+    //   Body: "{\"kind\":\"Status\",\"message\":\"...\", ...}"
+    //   Headers: {...}
+    // Extract the Body JSON string, unescape it, and pull out "message".
+    try {
+      const bodyStart = raw.indexOf('Body: "')
+      const bodyEnd = raw.indexOf('"\nHeaders:')
+      if (bodyStart !== -1 && bodyEnd !== -1 && bodyEnd > bodyStart) {
+        const escaped = raw.substring(bodyStart + 7, bodyEnd)
+        // Body uses JSON string escaping: \" → " and \\ → \
+        const unescaped = escaped
+          .replace(/\\\\/g, '\x00') // protect \\ first
+          .replace(/\\"/g, '"')     // unescape \"
+          .replace(/\x00/g, '\\')  // restore \\
+        const parsed = JSON.parse(unescaped)
+        if (typeof parsed?.message === 'string') {
+          detail = parsed.message
+        }
+      }
+    } catch {
+      // Parsing failed — fall through and show the raw string
+    }
     throw new Error(`failed to create job pod:\n  ${detail}`)
   }
 
