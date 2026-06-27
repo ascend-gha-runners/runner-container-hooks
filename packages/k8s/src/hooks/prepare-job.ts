@@ -85,8 +85,18 @@ export async function prepareJob(
   } catch (err) {
     await prunePods()
     core.debug(`createPod failed: ${JSON.stringify(err)}`)
-    const message = (err as any)?.response?.body?.message || err
-    throw new Error(`failed to create job pod: ${message}`)
+    // The k8s client throws HttpException whose message is a multi-line string
+    // containing the raw HTTP dump. Extract the human-readable "message" field
+    // from the embedded JSON body so the log shows something like:
+    //   failed to create job pod:
+    //     spec.volumes[5].name: Duplicate value: "bad-hostpath"
+    // instead of the full HTTP dump.
+    const raw = err instanceof Error ? err.message : String(err)
+    const msgMatch = raw.match(/"message"\s*:\s*"((?:[^"\\]|\\.)*)"/s)
+    const detail = msgMatch
+      ? msgMatch[1].replace(/\\"/g, '"').replace(/\\n/g, '\n')
+      : raw
+    throw new Error(`failed to create job pod:\n  ${detail}`)
   }
 
   if (!createdPod?.metadata?.name) {
