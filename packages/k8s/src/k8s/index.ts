@@ -992,16 +992,19 @@ export async function waitForPodPhases(
     // error (e.g. ImagePullBackOff) -- fail fast with diagnostics instead of
     // waiting out the full timeout.
     const containerErrors = getContainerErrors(pod)
-    // Check pod Warning events (e.g. FailedMount, FailedScheduling). Best-effort:
-    // silently returns [] when the optional 'events' RBAC permission is absent.
+    // Check pod Warning events (FailedMount, FailedScheduling, FailedBinding).
+    // Best-effort: returns [] when the optional events RBAC permission is absent.
     const eventErrors = await getPodEventErrors(podName)
-    // Check pod conditions as RBAC-free fallback for scheduling failures
-    // (PodScheduled=False/Unschedulable). Deduplicates with eventErrors: if both
-    // fire for the same FailedScheduling, the eventErrors entry takes precedence
-    // (it has richer count/message), so we only add conditionErrors when eventErrors
-    // is empty (i.e. events RBAC is unavailable).
-    const conditionErrors =
-      eventErrors.length === 0 ? getPodConditionErrors(pod) : []
+    // ALWAYS run condition check (not just as fallback when events are empty):
+    // conditions are set near-instantly by the scheduler while events may take
+    // a few extra seconds to propagate. Running both ensures we catch scheduling
+    // failures even if events appear slightly later. Deduplicate the output so
+    // the same failure isn't printed twice (event and condition both fire for
+    // FailedScheduling when RBAC works).
+    const rawConditionErrors = getPodConditionErrors(pod)
+    const conditionErrors = rawConditionErrors.filter(
+      c => !eventErrors.some(e => e.includes('FailedScheduling') && c.includes('Unschedulable'))
+    )
     if (containerErrors.length > 0 || eventErrors.length > 0 || conditionErrors.length > 0) {
       const allErrors = [...containerErrors, ...eventErrors, ...conditionErrors]
       const details = await describePodFailure(podName)
