@@ -764,6 +764,33 @@ export function getContainerErrors(pod: k8s.V1Pod): string[] {
   return errors
 }
 
+// Inspects the pod's status.conditions for deterministic scheduling failures.
+// This is the RBAC-free companion to getPodEventErrors: pod conditions are
+// always readable without the optional 'events' list permission.
+//
+//   PodScheduled=False/Unschedulable: no node matched the pod's requirements
+//   (nodeSelector mismatch, insufficient resources). The scheduler sets this
+//   condition almost immediately and continues retrying. Self-healing IS
+//   possible (a node might free up), so this is a fallback used only when
+//   getPodEventErrors returns nothing (events RBAC unavailable). When events
+//   ARE available, the FailedScheduling event fires first and gates by count.
+//
+// Never throws; on any unexpected error it returns [].
+export function getPodConditionErrors(pod: k8s.V1Pod): string[] {
+  const errors: string[] = []
+  for (const cond of pod.status?.conditions ?? []) {
+    if (
+      cond.type === 'PodScheduled' &&
+      cond.status === 'False' &&
+      cond.reason === 'Unschedulable'
+    ) {
+      const msg = cond.message ? `\n    ${cond.message}` : ''
+      errors.push(`  ✗ condition: ${cond.type}=False (${cond.reason})${msg}`)
+    }
+  }
+  return errors
+}
+
 // Inspects the pod's Warning events for reasons in UNRECOVERABLE_EVENT_REASONS
 // (e.g. FailedMount when a hostPath directory does not exist). Unlike container
 // waiting reasons, these appear only in the event stream, so a separate API
@@ -965,14 +992,18 @@ export async function waitForPodPhases(
     // error (e.g. ImagePullBackOff) -- fail fast with diagnostics instead of
     // waiting out the full timeout.
     const containerErrors = getContainerErrors(pod)
-    // Also check the pod's Warning events for unrecoverable event reasons such
-    // as FailedMount (hostPath directory missing). These never show up in
-    // container.status.state.waiting.reason -- the container stays in
-    // ContainerCreating -- so without this check the hook would poll until the
-    // 3600s timeout.
+    // Check pod Warning events (e.g. FailedMount, FailedScheduling). Best-effort:
+    // silently returns [] when the optional 'events' RBAC permission is absent.
     const eventErrors = await getPodEventErrors(podName)
-    if (containerErrors.length > 0 || eventErrors.length > 0) {
-      const allErrors = [...containerErrors, ...eventErrors]
+    // Check pod conditions as RBAC-free fallback for scheduling failures
+    // (PodScheduled=False/Unschedulable). Deduplicates with eventErrors: if both
+    // fire for the same FailedScheduling, the eventErrors entry takes precedence
+    // (it has richer count/message), so we only add conditionErrors when eventErrors
+    // is empty (i.e. events RBAC is unavailable).
+    const conditionErrors =
+      eventErrors.length === 0 ? getPodConditionErrors(pod) : []
+    if (containerErrors.length > 0 || eventErrors.length > 0 || conditionErrors.length > 0) {
+      const allErrors = [...containerErrors, ...eventErrors, ...conditionErrors]
       const details = await describePodFailure(podName)
       throw new Error(
         `Pod ${podName} has unrecoverable errors:\n${allErrors.join('\n')}\n${'─'.repeat(60)}\n${details}`
