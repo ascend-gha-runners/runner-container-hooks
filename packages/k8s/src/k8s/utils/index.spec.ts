@@ -206,7 +206,7 @@ describe('writeContainerStepScript', () => {
 
   it('throws on invalid working directory', () => {
     expect(() =>
-      writeContainerStepScript(tmpDir, '/too-short', 'sh')
+      writeContainerStepScript(tmpDir, 'tooshort', 'sh')
     ).toThrow('Invalid working directory')
   })
 
