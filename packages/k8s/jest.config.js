@@ -6,9 +6,8 @@ module.exports = {
   testMatch: ['**/*-test.ts'],
   testRunner: 'jest-circus/runner',
   verbose: true,
-  collectCoverage: true,
   collectCoverageFrom: [
-    'src/**/utils/**/*.ts',
+    'src/**/*.ts',
     '!src/**/*.d.ts'
   ],
   coverageDirectory: 'coverage',
