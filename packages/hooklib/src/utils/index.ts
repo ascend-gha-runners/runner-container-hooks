@@ -2,7 +2,7 @@ import * as events from 'events'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as readline from 'readline'
-import { HookData } from './interfaces'
+import { HookData } from '../interfaces'
 
 export async function getInputFromStdin(): Promise<HookData> {
   let input = ''

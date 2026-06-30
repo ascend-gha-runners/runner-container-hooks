@@ -6,6 +6,13 @@ module.exports = {
   testMatch: ['**/*-test.ts'],
   testRunner: 'jest-circus/runner',
   verbose: true,
+  collectCoverage: true,
+  collectCoverageFrom: [
+    'src/**/utils/**/*.ts',
+    '!src/**/*.d.ts'
+  ],
+  coverageDirectory: 'coverage',
+  coverageReporters: ['lcov', 'text-summary'],
   transform: {
     '^.+\\.ts$': [
       'ts-jest',
