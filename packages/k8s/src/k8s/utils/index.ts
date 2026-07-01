@@ -3,7 +3,7 @@ import * as fs from 'fs'
 import * as yaml from 'js-yaml'
 import * as core from '@actions/core'
 import { v1 as uuidv4 } from 'uuid'
-import { CONTAINER_EXTENSION_PREFIX } from '../hooks/constants'
+import { CONTAINER_EXTENSION_PREFIX } from '../../hooks/constants'
 import * as shlex from 'shlex'
 import { Mount } from 'hooklib'
 
