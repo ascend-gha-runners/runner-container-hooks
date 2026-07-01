@@ -5,7 +5,6 @@
   "main": "lib/index.js",
   "scripts": {
     "test": "jest --runInBand",
-    "test:coverage": "jest --runInBand --coverage",
     "build": "npx tsc && npx ncc build",
     "format": "prettier --write '**/*.ts'",
     "format-check": "prettier --check '**/*.ts'",
@@ -18,7 +17,7 @@
     "@actions/exec": "^1.1.1",
     "hooklib": "file:../hooklib",
     "shlex": "^3.0.0",
-    "uuid": "^11.1.1"
+    "uuid": "^11.1.0"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",

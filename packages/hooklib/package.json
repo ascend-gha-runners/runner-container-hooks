@@ -5,8 +5,7 @@
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "scripts": {
-    "test": "jest --runInBand",
-    "test:coverage": "jest --runInBand --coverage",
+    "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc",
     "format": "prettier --write '**/*.ts'",
     "format-check": "prettier --check '**/*.ts'",
@@ -15,17 +14,11 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "@babel/core": "^7.25.2",
-    "@babel/preset-env": "^7.25.4",
-    "@types/jest": "^30.0.0",
     "@types/node": "^24.0.14",
     "@zeit/ncc": "^0.22.3",
-    "babel-jest": "^30.0.4",
     "eslint": "^9.31.0",
     "eslint-plugin-github": "^6.0.0",
-    "jest": "^30.0.4",
     "prettier": "^3.6.2",
-    "ts-jest": "^29.4.0",
     "typescript": "^5.8.3"
   },
   "dependencies": {

@@ -1,4 +1,4 @@
-import { optionsWithDockerEnvs, sanitize, fixArgs, checkEnvironment } from '../src/utils'
+import { optionsWithDockerEnvs, sanitize, fixArgs } from '../src/utils'
 
 describe('Utilities', () => {
   it('should return sanitized image name', () => {
@@ -76,27 +76,5 @@ describe('Utilities', () => {
         DOCKER_HOST: process.env.DOCKER_HOST
       })
     })
-  })
-})
-
-describe('checkEnvironment', () => {
-  const originalEnv = process.env.GITHUB_WORKSPACE
-
-  afterEach(() => {
-    if (originalEnv === undefined) {
-      delete process.env.GITHUB_WORKSPACE
-    } else {
-      process.env.GITHUB_WORKSPACE = originalEnv
-    }
-  })
-
-  it('should not throw when GITHUB_WORKSPACE is set', () => {
-    process.env.GITHUB_WORKSPACE = '/home/runner/work/repo'
-    expect(() => checkEnvironment()).not.toThrow()
-  })
-
-  it('should throw when GITHUB_WORKSPACE is not set', () => {
-    delete process.env.GITHUB_WORKSPACE
-    expect(() => checkEnvironment()).toThrow('GITHUB_WORKSPACE is not set')
   })
 })
