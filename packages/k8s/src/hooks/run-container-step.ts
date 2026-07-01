@@ -6,9 +6,12 @@ import { dirname } from 'path'
 import {
   createContainerStepPod,
   deletePod,
+  describePodFailure,
   execCpFromPod,
   execCpToPod,
   execPodStep,
+  getContainerTerminatedErrors,
+  getPodByName,
   getPrepareJobTimeoutSeconds,
   waitForPodPhases
 } from '../k8s'
@@ -116,6 +119,18 @@ export async function runContainerStep(
       fs.rmSync(runnerPath, { force: true })
     }
   } catch (error) {
+    try {
+      const pod = await getPodByName(podName)
+      const terminatedErrors = getContainerTerminatedErrors(pod)
+      if (terminatedErrors.length > 0) {
+        const details = await describePodFailure(podName)
+        core.error(
+          `Pod ${podName} has unrecoverable container errors:\n${terminatedErrors.join('\n')}\n${details}`
+        )
+      }
+    } catch {
+      // Best-effort: pod may already be deleted or unreachable
+    }
     core.error(`Failed to run container step: ${error}`)
     throw error
   } finally {

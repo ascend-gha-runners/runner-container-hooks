@@ -2,11 +2,14 @@ import * as k8s from '@kubernetes/client-node'
 import {
   describePodFailure,
   getContainerErrors,
+  getContainerTerminatedErrors,
   getPodEventErrors,
   getUnrecoverableEventReasons,
+  getUnrecoverableTerminatedReasons,
   getUnrecoverableWaitingReasons,
   parsePodPhase,
   UNRECOVERABLE_EVENT_REASONS,
+  UNRECOVERABLE_TERMINATED_REASONS,
   UNRECOVERABLE_WAITING_REASONS,
   waitForPodPhases
 } from '../src/k8s'
@@ -38,6 +41,18 @@ function waitingContainer(
   return {
     name,
     state: { waiting: { reason, message } }
+  } as k8s.V1ContainerStatus
+}
+
+function terminatedContainer(
+  name: string,
+  reason?: string,
+  exitCode?: number,
+  message?: string
+): k8s.V1ContainerStatus {
+  return {
+    name,
+    state: { terminated: { reason, exitCode, message } }
   } as k8s.V1ContainerStatus
 }
 
@@ -294,6 +309,139 @@ describe('getUnrecoverableEventReasons', () => {
     }
     expect(reasons.has('FailedPreStopHook')).toBe(true)
     expect(reasons.has('FailedPostStartHook')).toBe(true)
+  })
+})
+
+describe('getContainerTerminatedErrors', () => {
+  it('returns no errors when there are no container statuses', () => {
+    expect(getContainerTerminatedErrors(buildPod(PodPhase.FAILED))).toEqual([])
+    expect(getContainerTerminatedErrors({} as k8s.V1Pod)).toEqual([])
+  })
+
+  it('returns no errors when containers have no terminated state', () => {
+    const pod = buildPod(PodPhase.RUNNING, {
+      containerStatuses: [
+        { name: 'job', state: { running: {} } } as k8s.V1ContainerStatus,
+        waitingContainer('sidecar', 'ContainerCreating')
+      ]
+    })
+    expect(getContainerTerminatedErrors(pod)).toEqual([])
+  })
+
+  it('returns no errors for terminated containers with recoverable reasons', () => {
+    const pod = buildPod(PodPhase.SUCCEEDED, {
+      containerStatuses: [
+        terminatedContainer('fs-init', 'Completed', 0)
+      ]
+    })
+    expect(getContainerTerminatedErrors(pod)).toEqual([])
+  })
+
+  it('detects OOMKilled', () => {
+    const pod = buildPod(PodPhase.FAILED, {
+      containerStatuses: [
+        terminatedContainer('job', 'OOMKilled', 137, 'The node was low on resource: memory')
+      ]
+    })
+    expect(getContainerTerminatedErrors(pod)).toEqual([
+      '  ✗ container "job": OOMKilled (exit code 137)\n    The node was low on resource: memory'
+    ])
+  })
+
+  it('detects Error (exit non-zero)', () => {
+    const pod = buildPod(PodPhase.FAILED, {
+      containerStatuses: [
+        terminatedContainer('job', 'Error', 1)
+      ]
+    })
+    expect(getContainerTerminatedErrors(pod)).toEqual([
+      '  ✗ container "job": Error (exit code 1)'
+    ])
+  })
+
+  it('detects FailedPostStartHookError', () => {
+    const pod = buildPod(PodPhase.FAILED, {
+      containerStatuses: [
+        terminatedContainer('job', 'FailedPostStartHookError', 137, 'postStart hook failed')
+      ]
+    })
+    expect(getContainerTerminatedErrors(pod)).toEqual([
+      '  ✗ container "job": FailedPostStartHookError (exit code 137)\n    postStart hook failed'
+    ])
+  })
+
+  it('detects every unrecoverable terminated reason', () => {
+    for (const reason of Array.from(UNRECOVERABLE_TERMINATED_REASONS)) {
+      const pod = buildPod(PodPhase.FAILED, {
+        containerStatuses: [terminatedContainer('job', reason, 1)]
+      })
+      expect(getContainerTerminatedErrors(pod)).toEqual([
+        `  ✗ container "job": ${reason} (exit code 1)`
+      ])
+    }
+  })
+
+  it('detects terminated errors in init containers as well', () => {
+    const pod = buildPod(PodPhase.FAILED, {
+      initContainerStatuses: [terminatedContainer('init', 'Error', 2)],
+      containerStatuses: [terminatedContainer('job', 'OOMKilled', 137)]
+    })
+    expect(getContainerTerminatedErrors(pod)).toEqual([
+      '  ✗ container "init": Error (exit code 2)',
+      '  ✗ container "job": OOMKilled (exit code 137)'
+    ])
+  })
+
+  it('ignores terminated with reason not in the whitelist', () => {
+    const pod = buildPod(PodPhase.SUCCEEDED, {
+      containerStatuses: [
+        terminatedContainer('job', 'Completed', 0)
+      ]
+    })
+    expect(getContainerTerminatedErrors(pod)).toEqual([])
+  })
+})
+
+describe('getUnrecoverableTerminatedReasons', () => {
+  afterEach(() => {
+    delete process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_TERMINATED_REASONS']
+  })
+
+  it('returns the built-in defaults when the env var is unset', () => {
+    expect(getUnrecoverableTerminatedReasons()).toEqual(UNRECOVERABLE_TERMINATED_REASONS)
+  })
+
+  it('adds extra reasons from the env var without dropping the defaults', () => {
+    process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_TERMINATED_REASONS'] =
+      'DeadlineExceeded, CustomReason'
+    const reasons = getUnrecoverableTerminatedReasons()
+    for (const builtin of Array.from(UNRECOVERABLE_TERMINATED_REASONS)) {
+      expect(reasons.has(builtin)).toBe(true)
+    }
+    expect(reasons.has('DeadlineExceeded')).toBe(true)
+    expect(reasons.has('CustomReason')).toBe(true)
+  })
+
+  it('makes getContainerTerminatedErrors honor the extended whitelist', () => {
+    process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_TERMINATED_REASONS'] =
+      'DeadlineExceeded'
+    const pod = buildPod(PodPhase.FAILED, {
+      containerStatuses: [terminatedContainer('job', 'DeadlineExceeded', 1)]
+    })
+    expect(getContainerTerminatedErrors(pod)).toEqual([
+      '  ✗ container "job": DeadlineExceeded (exit code 1)'
+    ])
+  })
+
+  it('filters empty strings from the env var', () => {
+    process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_TERMINATED_REASONS'] =
+      ', , CustomReason, '
+    const reasons = getUnrecoverableTerminatedReasons()
+    expect(reasons.has('')).toBe(false)
+    expect(reasons.has('CustomReason')).toBe(true)
+    for (const builtin of Array.from(UNRECOVERABLE_TERMINATED_REASONS)) {
+      expect(reasons.has(builtin)).toBe(true)
+    }
   })
 })
 
