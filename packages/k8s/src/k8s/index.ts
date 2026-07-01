@@ -679,7 +679,8 @@ export const UNRECOVERABLE_WAITING_REASONS = new Set([
   'ErrImagePull',
   'InvalidImageName',
   'CreateContainerConfigError',
-  'CreateContainerError'
+  'CreateContainerError',
+  'FailedMount'
 ])
 
 // Pod *event* reasons (from the event stream, not container status) that
@@ -702,6 +703,12 @@ export const UNRECOVERABLE_EVENT_REASONS = new Set([
   'FailedMount',
   'FailedScheduling',
   'FailedBinding'
+])
+
+export const UNRECOVERABLE_TERMINATED_REASONS = new Set([
+  'OOMKilled',
+  'Error',
+  'FailedPostStartHookError'
 ])
 
 // Maximum number of Warning events to include in a pod's failure description so
@@ -745,6 +752,21 @@ export function getUnrecoverableEventReasons(): Set<string> {
   return reasons
 }
 
+export function getUnrecoverableTerminatedReasons(): Set<string> {
+  const extra = process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_TERMINATED_REASONS']
+  if (!extra) {
+    return UNRECOVERABLE_TERMINATED_REASONS
+  }
+  const reasons = new Set(UNRECOVERABLE_TERMINATED_REASONS)
+  for (const reason of extra.split(',')) {
+    const trimmed = reason.trim()
+    if (trimmed) {
+      reasons.add(trimmed)
+    }
+  }
+  return reasons
+}
+
 export function getContainerErrors(pod: k8s.V1Pod): string[] {
   const errors: string[] = []
   const unrecoverableReasons = getUnrecoverableWaitingReasons()
@@ -759,6 +781,24 @@ export function getContainerErrors(pod: k8s.V1Pod): string[] {
       const reason = `  ✗ container "${cs.name}": ${waiting.reason}`
       const detail = waiting.message ? `    ${waiting.message}` : ''
       errors.push(detail ? `${reason}\n${detail}` : reason)
+    }
+  }
+  return errors
+}
+
+export function getContainerTerminatedErrors(pod: k8s.V1Pod): string[] {
+  const errors: string[] = []
+  const unrecoverableReasons = getUnrecoverableTerminatedReasons()
+  const allStatuses = [
+    ...(pod.status?.initContainerStatuses ?? []),
+    ...(pod.status?.containerStatuses ?? [])
+  ]
+  for (const cs of allStatuses) {
+    const terminated = cs.state?.terminated
+    if (terminated?.reason && unrecoverableReasons.has(terminated.reason)) {
+      const reason = `  ✗ container "${cs.name}": ${terminated.reason} (exit code ${terminated.exitCode})`
+      const detail = terminated.message ? `\n    ${terminated.message}` : ''
+      errors.push(detail ? `${reason}${detail}` : reason)
     }
   }
   return errors
