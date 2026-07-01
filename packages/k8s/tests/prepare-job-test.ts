@@ -13,6 +13,7 @@ import { getPodByName, prunePods, waitForPodPhases } from '../src/k8s'
 import { V1Container } from '@kubernetes/client-node'
 import * as yaml from 'js-yaml'
 import { JOB_CONTAINER_NAME } from '../src/hooks/constants'
+import * as io from '@actions/io'
 import * as k8sModule from '../src/k8s'
 import * as coreModule from '@actions/core'
 
@@ -252,10 +253,12 @@ describe('prepareJob error handling - prunePods try-catch', () => {
   let prunePodsSpy: jest.SpyInstance
   let waitForPodPhasesSpy: jest.SpyInstance
   let createPodSpy: jest.SpyInstance
+  let ioCpSpy: jest.SpyInstance
 
   beforeEach(() => {
     process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
     delete process.env[ENV_HOOK_TEMPLATE_PATH]
+    delete process.env['RUNNER_WORKSPACE']
 
     coreErrorSpy = jest.spyOn(coreModule, 'error').mockImplementation(() => {})
     prunePodsSpy = jest.spyOn(k8sModule, 'prunePods').mockResolvedValue(undefined)
@@ -265,6 +268,7 @@ describe('prepareJob error handling - prunePods try-catch', () => {
     waitForPodPhasesSpy = jest
       .spyOn(k8sModule, 'waitForPodPhases')
       .mockRejectedValue(new Error('pod failed to come online: unrecoverable condition'))
+    ioCpSpy = jest.spyOn(io, 'cp').mockResolvedValue(undefined)
   })
 
   afterEach(() => {
