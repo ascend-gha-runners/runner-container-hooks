@@ -10,6 +10,9 @@ import {
   getUnrecoverableTerminatedReasons,
   UNRECOVERABLE_TERMINATED_REASONS
 } from '../src/k8s'
+import * as k8sModule from '../src/k8s'
+import * as coreModule from '@actions/core'
+import { RunContainerStepArgs } from 'hooklib'
 
 import { PodPhase } from '../src/k8s/utils'
 
@@ -251,5 +254,169 @@ describe('getUnrecoverableTerminatedReasons', () => {
     const reasons = getUnrecoverableTerminatedReasons()
     expect(reasons.has('CrashLoopBackOff')).toBe(true)
     expect(reasons.has('')).toBe(false)
+  })
+})
+
+describe('runContainerStep includes describePodFailure output for terminated errors', () => {
+  let coreErrorSpy: jest.SpyInstance
+  let createJobSpy: jest.SpyInstance
+  let getContainerJobPodNameSpy: jest.SpyInstance
+  let waitForPodPhasesSpy: jest.SpyInstance
+  let getPodLogsSpy: jest.SpyInstance
+  let waitForJobToCompleteSpy: jest.SpyInstance
+  let getPodStatusSpy: jest.SpyInstance
+  let getPodByNameSpy: jest.SpyInstance
+  let describePodFailureSpy: jest.SpyInstance
+
+  const podName = 'test-pod-abc123'
+  const jobName = 'test-job-xyz789'
+
+  const diagnosticOutput = [
+    'Phase: Failed',
+    '────────────────────────────────────────────────────────────',
+    '  ✗ Ready=False (ContainersNotReady): containers with unready status: [job]',
+    '  ✗ container "job": OOMKilled (exit code 137)',
+    '    Memory limit exceeded'
+  ].join('\n')
+
+  function makeMinimalArgs(): RunContainerStepArgs {
+    return {
+      image: 'test-image:latest',
+      workingDirectory: '/__w/repo/repo',
+      entryPoint: 'bash',
+      entryPointArgs: ['-c', 'echo test'],
+      systemMountVolumes: []
+    } as RunContainerStepArgs
+  }
+
+  function podStatusWithTerminated(
+    reason: string,
+    exitCode: number,
+    message?: string
+  ): k8s.V1PodStatus {
+    return {
+      phase: 'Failed',
+      containerStatuses: [
+        {
+          name: 'job',
+          image: 'test-image:latest',
+          imageID: '',
+          ready: false,
+          restartCount: 0,
+          state: {
+            terminated: { exitCode, reason, message }
+          }
+        } as k8s.V1ContainerStatus
+      ]
+    }
+  }
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    delete process.env[ENV_HOOK_TEMPLATE_PATH]
+
+    coreErrorSpy = jest.spyOn(coreModule, 'error').mockImplementation(() => {})
+
+    createJobSpy = jest.spyOn(k8sModule, 'createJob').mockResolvedValue({
+      metadata: { name: jobName }
+    } as k8s.V1Job)
+
+    getContainerJobPodNameSpy = jest
+      .spyOn(k8sModule, 'getContainerJobPodName')
+      .mockResolvedValue(podName)
+
+    waitForPodPhasesSpy = jest
+      .spyOn(k8sModule, 'waitForPodPhases')
+      .mockResolvedValue(undefined)
+
+    getPodLogsSpy = jest
+      .spyOn(k8sModule, 'getPodLogs')
+      .mockResolvedValue(undefined)
+
+    waitForJobToCompleteSpy = jest
+      .spyOn(k8sModule, 'waitForJobToComplete')
+      .mockResolvedValue(undefined)
+
+    describePodFailureSpy = jest
+      .spyOn(k8sModule, 'describePodFailure')
+      .mockResolvedValue(diagnosticOutput)
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('includes describePodFailure output in core.error for OOMKilled container', async () => {
+    const pod: k8s.V1Pod = buildPod(PodPhase.FAILED, {
+      containerStatuses: [
+        terminatedContainer('job', 'OOMKilled', 137, 'Memory limit exceeded')
+      ]
+    })
+    getPodStatusSpy = jest
+      .spyOn(k8sModule, 'getPodStatus')
+      .mockResolvedValue(podStatusWithTerminated('OOMKilled', 137, 'Memory limit exceeded'))
+    getPodByNameSpy = jest
+      .spyOn(k8sModule, 'getPodByName')
+      .mockResolvedValue(pod)
+
+    await runContainerStep(makeMinimalArgs())
+
+    expect(describePodFailureSpy).toHaveBeenCalledWith(podName)
+    expect(coreErrorSpy).toHaveBeenCalledTimes(1)
+    const errorMessage = coreErrorSpy.mock.calls[0][0]
+    expect(errorMessage).toContain('OOMKilled')
+    expect(errorMessage).toContain(diagnosticOutput)
+  })
+
+  it('includes describePodFailure output in core.error for Error (exit non-zero) container', async () => {
+    const pod: k8s.V1Pod = buildPod(PodPhase.FAILED, {
+      containerStatuses: [
+        terminatedContainer('job', 'Error', 1, 'container crashed')
+      ]
+    })
+    getPodStatusSpy = jest
+      .spyOn(k8sModule, 'getPodStatus')
+      .mockResolvedValue(podStatusWithTerminated('Error', 1, 'container crashed'))
+    getPodByNameSpy = jest
+      .spyOn(k8sModule, 'getPodByName')
+      .mockResolvedValue(pod)
+
+    await runContainerStep(makeMinimalArgs())
+
+    expect(describePodFailureSpy).toHaveBeenCalledWith(podName)
+    expect(coreErrorSpy).toHaveBeenCalledTimes(1)
+    const errorMessage = coreErrorSpy.mock.calls[0][0]
+    expect(errorMessage).toContain('Error')
+    expect(errorMessage).toContain(diagnosticOutput)
+  })
+
+  it('includes describePodFailure output in core.error for FailedPostStartHookError container', async () => {
+    const pod: k8s.V1Pod = buildPod(PodPhase.FAILED, {
+      containerStatuses: [
+        terminatedContainer(
+          'job',
+          'FailedPostStartHookError',
+          137,
+          'postStart hook failed'
+        )
+      ]
+    })
+    getPodStatusSpy = jest
+      .spyOn(k8sModule, 'getPodStatus')
+      .mockResolvedValue(
+        podStatusWithTerminated('FailedPostStartHookError', 137, 'postStart hook failed')
+      )
+    getPodByNameSpy = jest
+      .spyOn(k8sModule, 'getPodByName')
+      .mockResolvedValue(pod)
+
+    await runContainerStep(makeMinimalArgs())
+
+    expect(describePodFailureSpy).toHaveBeenCalledWith(podName)
+    expect(coreErrorSpy).toHaveBeenCalledTimes(1)
+    const errorMessage = coreErrorSpy.mock.calls[0][0]
+    expect(errorMessage).toContain('FailedPostStartHookError')
+    expect(errorMessage).toContain(diagnosticOutput)
   })
 })

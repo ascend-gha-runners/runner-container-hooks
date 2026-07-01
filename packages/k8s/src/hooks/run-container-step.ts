@@ -4,6 +4,7 @@ import { RunContainerStepArgs } from 'hooklib'
 import {
   createJob,
   createSecretForEnvs,
+  describePodFailure,
   getContainerJobPodName,
   getContainerTerminatedErrors,
   getPodByName,
@@ -112,8 +113,9 @@ export async function runContainerStep(
   const pod = await getPodByName(podName)
   const terminatedErrors = getContainerTerminatedErrors(pod)
   if (terminatedErrors.length > 0) {
+    const details = await describePodFailure(podName)
     core.error(
-      `Pod ${podName} has unrecoverable container errors:\n${terminatedErrors.join('\n')}`
+      `Pod ${podName} has unrecoverable container errors:\n${terminatedErrors.join('\n')}\n${details}`
     )
   }
 
