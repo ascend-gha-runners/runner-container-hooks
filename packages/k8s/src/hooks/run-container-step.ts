@@ -5,6 +5,8 @@ import {
   createJob,
   createSecretForEnvs,
   getContainerJobPodName,
+  getContainerTerminatedErrors,
+  getPodByName,
   getPodLogs,
   getPodStatus,
   waitForJobToComplete,
@@ -106,6 +108,15 @@ export async function runContainerStep(
     )
     return 1
   }
+
+  const pod = await getPodByName(podName)
+  const terminatedErrors = getContainerTerminatedErrors(pod)
+  if (terminatedErrors.length > 0) {
+    core.error(
+      `Pod ${podName} has unrecoverable container errors:\n${terminatedErrors.join('\n')}`
+    )
+  }
+
   const exitCode =
     status.containerStatuses[status.containerStatuses.length - 1].state
       ?.terminated?.exitCode

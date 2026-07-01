@@ -373,7 +373,20 @@ export const UNRECOVERABLE_WAITING_REASONS = new Set([
   'ErrImagePull',
   'InvalidImageName',
   'CreateContainerConfigError',
-  'CreateContainerError'
+  'CreateContainerError',
+  'FailedMount'
+])
+
+export const UNRECOVERABLE_EVENT_REASONS = new Set([
+  'FailedScheduling',
+  'FailedBinding',
+  'FailedMount'
+])
+
+export const UNRECOVERABLE_TERMINATED_REASONS = new Set([
+  'OOMKilled',
+  'Error',
+  'FailedPostStartHookError'
 ])
 
 const MAX_DIAGNOSTIC_EVENTS = 10
@@ -384,6 +397,37 @@ export function getUnrecoverableWaitingReasons(): Set<string> {
     return UNRECOVERABLE_WAITING_REASONS
   }
   const reasons = new Set(UNRECOVERABLE_WAITING_REASONS)
+  for (const reason of extra.split(',')) {
+    const trimmed = reason.trim()
+    if (trimmed) {
+      reasons.add(trimmed)
+    }
+  }
+  return reasons
+}
+
+export function getUnrecoverableEventReasons(): Set<string> {
+  const extra = process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_EVENT_REASONS']
+  if (!extra) {
+    return UNRECOVERABLE_EVENT_REASONS
+  }
+  const reasons = new Set(UNRECOVERABLE_EVENT_REASONS)
+  for (const reason of extra.split(',')) {
+    const trimmed = reason.trim()
+    if (trimmed) {
+      reasons.add(trimmed)
+    }
+  }
+  return reasons
+}
+
+export function getUnrecoverableTerminatedReasons(): Set<string> {
+  const extra =
+    process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_TERMINATED_REASONS']
+  if (!extra) {
+    return UNRECOVERABLE_TERMINATED_REASONS
+  }
+  const reasons = new Set(UNRECOVERABLE_TERMINATED_REASONS)
   for (const reason of extra.split(',')) {
     const trimmed = reason.trim()
     if (trimmed) {
@@ -406,6 +450,74 @@ export function getContainerErrors(pod: k8s.V1Pod): string[] {
       errors.push(
         `container "${cs.name}": ${waiting.reason}${
           waiting.message ? ` - ${waiting.message}` : ''
+        }`
+      )
+    }
+  }
+  return errors
+}
+
+export async function getPodEventErrors(podName: string): Promise<string[]> {
+  const unrecoverableReasons = getUnrecoverableEventReasons()
+  let items: k8s.CoreV1Event[]
+  try {
+    const { body } = await k8sApi.listNamespacedEvent(
+      namespace(),
+      undefined,
+      undefined,
+      undefined,
+      `involvedObject.name=${podName}`
+    )
+    items = body.items
+  } catch (err) {
+    core.debug(
+      `Could not list events for pod ${podName} (the 'events' permission may be missing): ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    )
+    return []
+  }
+
+  const errors: string[] = []
+  for (const e of items) {
+    if (
+      e.type === 'Warning' &&
+      e.reason &&
+      unrecoverableReasons.has(e.reason)
+    ) {
+      errors.push(`Event [Warning] ${e.reason}: ${e.message ?? ''}`)
+    }
+  }
+  return errors
+}
+
+export function getPodConditionErrors(pod: k8s.V1Pod): string[] {
+  const errors: string[] = []
+  for (const cond of pod.status?.conditions ?? []) {
+    if (cond.status === 'False') {
+      errors.push(
+        `Condition ${cond.type}=False (reason: ${cond.reason ?? ''}): ${
+          cond.message ?? ''
+        }`
+      )
+    }
+  }
+  return errors
+}
+
+export function getContainerTerminatedErrors(pod: k8s.V1Pod): string[] {
+  const errors: string[] = []
+  const unrecoverableReasons = getUnrecoverableTerminatedReasons()
+  const allStatuses = [
+    ...(pod.status?.initContainerStatuses ?? []),
+    ...(pod.status?.containerStatuses ?? [])
+  ]
+  for (const cs of allStatuses) {
+    const terminated = cs.state?.terminated
+    if (terminated?.reason && unrecoverableReasons.has(terminated.reason)) {
+      errors.push(
+        `container "${cs.name}": ${terminated.reason} (exit code ${terminated.exitCode}) - ${
+          terminated.message ?? ''
         }`
       )
     }
@@ -437,11 +549,14 @@ export async function describePodFailure(podName: string): Promise<string> {
     lines.push(`Message: ${status.message}`)
   }
 
+  const separator = '────────────────────────────────────────────────────────────'
+  lines.push(separator)
+
   for (const cond of status?.conditions ?? []) {
     if (cond.status === 'False') {
       lines.push(
-        `Condition ${cond.type}=False${
-          cond.reason ? ` (reason: ${cond.reason})` : ''
+        `  ✗ ${cond.type}=False${
+          cond.reason ? ` (${cond.reason})` : ''
         }${cond.message ? `: ${cond.message}` : ''}`
       )
     }
@@ -455,18 +570,18 @@ export async function describePodFailure(podName: string): Promise<string> {
     const waiting = cs.state?.waiting
     if (waiting?.reason) {
       lines.push(
-        `Container "${cs.name}" waiting: ${waiting.reason}${
-          waiting.message ? ` - ${waiting.message}` : ''
+        `  ✗ container "${cs.name}": ${waiting.reason}${
+          waiting.message ? `\n    ${waiting.message}` : ''
         }`
       )
     }
     const terminated = cs.state?.terminated
     if (terminated) {
       lines.push(
-        `Container "${cs.name}" terminated: ${
+        `  ✗ container "${cs.name}": ${
           terminated.reason ?? 'Unknown'
         } (exit code ${terminated.exitCode})${
-          terminated.message ? ` - ${terminated.message}` : ''
+          terminated.message ? `\n    ${terminated.message}` : ''
         }`
       )
     }
@@ -553,6 +668,26 @@ export async function waitForPodPhases(
       const details = await describePodFailure(podName)
       throw new Error(
         `Pod ${podName} has unrecoverable container errors: ${containerErrors.join(
+          '; '
+        )}\n${details}`
+      )
+    }
+
+    const conditionErrors = getPodConditionErrors(pod)
+    if (conditionErrors.length > 0) {
+      const details = await describePodFailure(podName)
+      throw new Error(
+        `Pod ${podName} has unrecoverable condition errors: ${conditionErrors.join(
+          '; '
+        )}\n${details}`
+      )
+    }
+
+    const eventErrors = await getPodEventErrors(podName)
+    if (eventErrors.length > 0) {
+      const details = await describePodFailure(podName)
+      throw new Error(
+        `Pod ${podName} has unrecoverable event errors: ${eventErrors.join(
           '; '
         )}\n${details}`
       )

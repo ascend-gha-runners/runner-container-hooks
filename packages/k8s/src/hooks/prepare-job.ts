@@ -100,7 +100,8 @@ export async function prepareJob(
     )
   } catch (err) {
     await prunePods()
-    throw new Error(`pod failed to come online with error: ${err}`)
+    const message = err instanceof Error ? err.message : String(err)
+    throw new Error(`pod failed to come online:\n${message}`)
   }
 
   core.debug('Job pod is ready for traffic')
