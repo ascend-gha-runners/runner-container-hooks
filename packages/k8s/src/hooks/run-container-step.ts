@@ -117,6 +117,7 @@ export async function runContainerStep(
     core.error(
       `Pod ${podName} has unrecoverable container errors:\n${terminatedErrors.join('\n')}\n${details}`
     )
+    return 1
   }
 
   const exitCode =

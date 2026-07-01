@@ -99,7 +99,11 @@ export async function prepareJob(
       getPrepareJobTimeoutSeconds()
     )
   } catch (err) {
-    await prunePods()
+    try {
+      await prunePods()
+    } catch (pruneErr) {
+      core.error(`Failed to prune pods: ${pruneErr instanceof Error ? pruneErr.message : String(pruneErr)}`)
+    }
     const message = err instanceof Error ? err.message : String(err)
     throw new Error(`pod failed to come online:\n${message}`)
   }

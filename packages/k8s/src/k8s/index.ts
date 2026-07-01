@@ -373,8 +373,7 @@ export const UNRECOVERABLE_WAITING_REASONS = new Set([
   'ErrImagePull',
   'InvalidImageName',
   'CreateContainerConfigError',
-  'CreateContainerError',
-  'FailedMount'
+  'CreateContainerError'
 ])
 
 export const UNRECOVERABLE_EVENT_REASONS = new Set([
@@ -494,7 +493,7 @@ export async function getPodEventErrors(podName: string): Promise<string[]> {
 export function getPodConditionErrors(pod: k8s.V1Pod): string[] {
   const errors: string[] = []
   for (const cond of pod.status?.conditions ?? []) {
-    if (cond.status === 'False') {
+    if (cond.type === 'PodScheduled' && cond.status === 'False' && cond.reason === 'Unschedulable') {
       errors.push(
         `Condition ${cond.type}=False (reason: ${cond.reason ?? ''}): ${
           cond.message ?? ''
@@ -678,16 +677,6 @@ export async function waitForPodPhases(
       const details = await describePodFailure(podName)
       throw new Error(
         `Pod ${podName} has unrecoverable condition errors: ${conditionErrors.join(
-          '; '
-        )}\n${details}`
-      )
-    }
-
-    const eventErrors = await getPodEventErrors(podName)
-    if (eventErrors.length > 0) {
-      const details = await describePodFailure(podName)
-      throw new Error(
-        `Pod ${podName} has unrecoverable event errors: ${eventErrors.join(
           '; '
         )}\n${details}`
       )

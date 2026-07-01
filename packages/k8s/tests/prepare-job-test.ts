@@ -9,10 +9,12 @@ import {
   generateContainerName,
   readExtensionFromFile
 } from '../src/k8s/utils'
-import { getPodByName } from '../src/k8s'
+import { getPodByName, prunePods, waitForPodPhases } from '../src/k8s'
 import { V1Container } from '@kubernetes/client-node'
 import * as yaml from 'js-yaml'
 import { JOB_CONTAINER_NAME } from '../src/hooks/constants'
+import * as k8sModule from '../src/k8s'
+import * as coreModule from '@actions/core'
 
 jest.useRealTimers()
 
@@ -243,4 +245,91 @@ describe('Prepare job', () => {
       expect(() => content.context.services[0].image).not.toThrow()
     }
   )
+})
+
+describe('prepareJob error handling - prunePods try-catch', () => {
+  let coreErrorSpy: jest.SpyInstance
+  let prunePodsSpy: jest.SpyInstance
+  let waitForPodPhasesSpy: jest.SpyInstance
+  let createPodSpy: jest.SpyInstance
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    delete process.env[ENV_HOOK_TEMPLATE_PATH]
+
+    coreErrorSpy = jest.spyOn(coreModule, 'error').mockImplementation(() => {})
+    prunePodsSpy = jest.spyOn(k8sModule, 'prunePods').mockResolvedValue(undefined)
+    createPodSpy = jest.spyOn(k8sModule, 'createPod').mockResolvedValue({
+      metadata: { name: 'test-pod' }
+    } as any)
+    waitForPodPhasesSpy = jest
+      .spyOn(k8sModule, 'waitForPodPhases')
+      .mockRejectedValue(new Error('pod failed to come online: unrecoverable condition'))
+  })
+
+  afterEach(() => {
+    jest.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('propagates original waitForPodPhases error even when prunePods succeeds', async () => {
+    const args = {
+      container: {
+        image: 'test-image:latest',
+        environmentVariables: {}
+      },
+      services: []
+    } as any
+
+    await expect(prepareJob(args, '/tmp/test-output.json')).rejects.toThrow(
+      'pod failed to come online'
+    )
+    expect(prunePodsSpy).toHaveBeenCalledTimes(2)
+  })
+
+  it('propagates original waitForPodPhases error even when prunePods throws', async () => {
+    prunePodsSpy
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('k8s API error: forbidden'))
+
+    const args = {
+      container: {
+        image: 'test-image:latest',
+        environmentVariables: {}
+      },
+      services: []
+    } as any
+
+    await expect(prepareJob(args, '/tmp/test-output.json')).rejects.toThrow(
+      'pod failed to come online: unrecoverable condition'
+    )
+    expect(coreErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to prune pods')
+    )
+  })
+
+  it('logs prunePods error via core.error without masking original error message', async () => {
+    prunePodsSpy
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('k8s API error: forbidden'))
+
+    const args = {
+      container: {
+        image: 'test-image:latest',
+        environmentVariables: {}
+      },
+      services: []
+    } as any
+
+    try {
+      await prepareJob(args, '/tmp/test-output.json')
+    } catch (err) {
+      expect((err as Error).message).toContain('pod failed to come online')
+      expect((err as Error).message).toContain('unrecoverable condition')
+      expect((err as Error).message).not.toContain('k8s API error: forbidden')
+    }
+    expect(coreErrorSpy).toHaveBeenCalledWith(
+      expect.stringContaining('k8s API error: forbidden')
+    )
+  })
 })

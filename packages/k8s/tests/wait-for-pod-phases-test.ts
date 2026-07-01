@@ -88,7 +88,14 @@ describe('getContainerErrors', () => {
     expect(getContainerErrors(pod)).toEqual([])
   })
 
-  it('detects every unrecoverable waiting reason including FailedMount', () => {
+  it('does not detect FailedMount as a waiting reason', () => {
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'FailedMount')]
+    })
+    expect(getContainerErrors(pod)).toEqual([])
+  })
+
+  it('detects every unrecoverable waiting reason', () => {
     for (const reason of Array.from(UNRECOVERABLE_WAITING_REASONS)) {
       const pod = buildPod(PodPhase.PENDING, {
         containerStatuses: [waitingContainer('job', reason)]
@@ -152,7 +159,7 @@ describe('getPodConditionErrors', () => {
     expect(getPodConditionErrors(pod)).toEqual([])
   })
 
-  it('detects PodScheduled=False with reason and message', () => {
+  it('detects PodScheduled=False with Unschedulable reason only', () => {
     const pod = buildPod(PodPhase.PENDING, {
       conditions: [
         {
@@ -168,7 +175,35 @@ describe('getPodConditionErrors', () => {
     ])
   })
 
-  it('detects multiple False conditions', () => {
+  it('ignores Ready=False which is normal during Pending phase', () => {
+    const pod = buildPod(PodPhase.PENDING, {
+      conditions: [
+        {
+          type: 'Ready',
+          status: 'False',
+          reason: 'ContainersNotReady',
+          message: 'containers with unready status: [job]'
+        } as k8s.V1PodCondition
+      ]
+    })
+    expect(getPodConditionErrors(pod)).toEqual([])
+  })
+
+  it('ignores PodScheduled=False with non-Unschedulable reason', () => {
+    const pod = buildPod(PodPhase.PENDING, {
+      conditions: [
+        {
+          type: 'PodScheduled',
+          status: 'False',
+          reason: 'SomeOtherReason',
+          message: 'some message'
+        } as k8s.V1PodCondition
+      ]
+    })
+    expect(getPodConditionErrors(pod)).toEqual([])
+  })
+
+  it('detects PodScheduled=False/Unschedulable alongside other normal False conditions', () => {
     const pod = buildPod(PodPhase.PENDING, {
       conditions: [
         {
@@ -186,19 +221,19 @@ describe('getPodConditionErrors', () => {
       ]
     })
     const errors = getPodConditionErrors(pod)
-    expect(errors.length).toBe(2)
+    expect(errors.length).toBe(1)
     expect(errors[0]).toContain('PodScheduled=False')
-    expect(errors[1]).toContain('Ready=False')
+    expect(errors[0]).toContain('Unschedulable')
   })
 
-  it('handles conditions without reason or message', () => {
+  it('handles PodScheduled=False/Unschedulable without message', () => {
     const pod = buildPod(PodPhase.PENDING, {
       conditions: [
-        { type: 'Ready', status: 'False' } as k8s.V1PodCondition
+        { type: 'PodScheduled', status: 'False', reason: 'Unschedulable' } as k8s.V1PodCondition
       ]
     })
     expect(getPodConditionErrors(pod)).toEqual([
-      'Condition Ready=False (reason: ): '
+      'Condition PodScheduled=False (reason: Unschedulable): '
     ])
   })
 })
@@ -491,7 +526,28 @@ describe('waitForPodPhases', () => {
     ).rejects.toThrow('Pod my-pod is unhealthy with phase status Failed')
   })
 
-  it('surfaces condition errors when PodScheduled=False', async () => {
+  it('does NOT fail-fast on Ready=False condition (normal during Pending)', async () => {
+    readSpy
+      .mockResolvedValueOnce({
+        body: buildPod(PodPhase.PENDING, {
+          conditions: [
+            { type: 'Ready', status: 'False', reason: 'ContainersNotReady', message: 'containers unready' } as k8s.V1PodCondition,
+            { type: 'ContainersReady', status: 'False', reason: 'ContainersNotReady', message: 'containers unready' } as k8s.V1PodCondition
+          ]
+        })
+      } as never)
+      .mockResolvedValueOnce({ body: buildPod(PodPhase.RUNNING) } as never)
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).resolves.toBeUndefined()
+  })
+
+  it('surfaces condition errors when PodScheduled=False with Unschedulable', async () => {
     readSpy.mockResolvedValue({
       body: buildPod(PodPhase.PENDING, {
         conditions: [
@@ -514,10 +570,10 @@ describe('waitForPodPhases', () => {
     ).rejects.toThrow('condition errors')
   })
 
-  it('surfaces event errors when FailedScheduling event detected', async () => {
-    readSpy.mockResolvedValue({
-      body: buildPod(PodPhase.PENDING)
-    } as never)
+  it('does NOT fail-fast on transient event errors like FailedScheduling', async () => {
+    readSpy
+      .mockResolvedValueOnce({ body: buildPod(PodPhase.PENDING) } as never)
+      .mockResolvedValueOnce({ body: buildPod(PodPhase.RUNNING) } as never)
     eventSpy.mockResolvedValue({
       body: {
         items: [
@@ -536,7 +592,57 @@ describe('waitForPodPhases', () => {
         new Set([PodPhase.RUNNING]),
         new Set([PodPhase.PENDING])
       )
-    ).rejects.toThrow('event errors')
+    ).resolves.toBeUndefined()
+  })
+
+  it('does NOT fail-fast on FailedMount event errors', async () => {
+    readSpy
+      .mockResolvedValueOnce({ body: buildPod(PodPhase.PENDING) } as never)
+      .mockResolvedValueOnce({ body: buildPod(PodPhase.RUNNING) } as never)
+    eventSpy.mockResolvedValue({
+      body: {
+        items: [
+          {
+            type: 'Warning',
+            reason: 'FailedMount',
+            message: 'MountVolume.SetUp failed for volume'
+          }
+        ]
+      }
+    } as never)
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).resolves.toBeUndefined()
+  })
+
+  it('does NOT fail-fast on FailedBinding event errors', async () => {
+    readSpy
+      .mockResolvedValueOnce({ body: buildPod(PodPhase.PENDING) } as never)
+      .mockResolvedValueOnce({ body: buildPod(PodPhase.RUNNING) } as never)
+    eventSpy.mockResolvedValue({
+      body: {
+        items: [
+          {
+            type: 'Warning',
+            reason: 'FailedBinding',
+            message: 'no persistent volumes available'
+          }
+        ]
+      }
+    } as never)
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).resolves.toBeUndefined()
   })
 })
 
