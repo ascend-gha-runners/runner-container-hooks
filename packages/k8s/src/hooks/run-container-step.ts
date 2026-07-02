@@ -123,7 +123,7 @@ export async function runContainerStep(
       const pod = await getPodByName(podName)
       const terminatedErrors = getContainerTerminatedErrors(pod)
       if (terminatedErrors.length > 0) {
-        const details = await describePodFailure(podName)
+        const details = await describePodFailure(podName, pod)
         core.error(
           `Pod ${podName} has unrecoverable container errors:\n${terminatedErrors.join('\n')}\n${details}`
         )

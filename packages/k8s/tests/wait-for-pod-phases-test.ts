@@ -400,6 +400,16 @@ describe('getContainerTerminatedErrors', () => {
     })
     expect(getContainerTerminatedErrors(pod)).toEqual([])
   })
+
+  it('does not flag containers with unrecoverable reason but exitCode=0 (false positive guard)', () => {
+    const pod = buildPod(PodPhase.SUCCEEDED, {
+      containerStatuses: [
+        terminatedContainer('job', 'Error', 0),
+        terminatedContainer('side', 'OOMKilled', 0)
+      ]
+    })
+    expect(getContainerTerminatedErrors(pod)).toEqual([])
+  })
 })
 
 describe('getUnrecoverableTerminatedReasons', () => {
@@ -660,5 +670,26 @@ describe('describePodFailure', () => {
 
     const description = await describePodFailure('my-pod')
     expect(description).toContain('Could not read pod my-pod for diagnostics')
+  })
+
+  it('skips readPod when preFetchedPod is provided', async () => {
+    const pod = {
+      status: {
+        phase: PodPhase.FAILED,
+        containerStatuses: [
+          {
+            name: 'job',
+            state: { terminated: { exitCode: 1, reason: 'Error' } }
+          }
+        ]
+      }
+    } as k8s.V1Pod
+
+    readSpy.mockRejectedValue(new Error('should not be called') as never)
+
+    const description = await describePodFailure('my-pod', pod)
+    expect(readSpy).not.toHaveBeenCalled()
+    expect(description).toContain('Pod status: Failed')
+    expect(description).toContain('✗ container "job" terminated: Error (exit code 1)')
   })
 })

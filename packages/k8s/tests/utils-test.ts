@@ -16,7 +16,7 @@ import {
   useKubeScheduler,
   ENV_HOOK_TEMPLATE_PATH,
   ENV_USE_KUBE_SCHEDULER
-} from './index'
+} from '../src/k8s/utils'
 
 // Minimal temp dir helper for tests that write files
 function makeTempDir(): string {
