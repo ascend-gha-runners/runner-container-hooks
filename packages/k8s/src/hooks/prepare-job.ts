@@ -95,7 +95,8 @@ export async function prepareJob(
     let detail = raw
     // The k8s HttpException message is a multi-line dump:
     //   HTTP-Code: 422
-    //   Body: "{\"kind\":\"Status\",\"message\":\"...\", ...}"
+    //   Message: Unknown API Status Code!
+    //   Body: "{\"kind\":\"Status\",\"message\":\"...\\n\"}"
     //   Headers: {...}
     // Extract the Body JSON string, unescape it, and pull out "message".
     try {
@@ -104,18 +105,22 @@ export async function prepareJob(
       // string ends before Headers — use the last '"' before 'Headers:' as fallback
       const headersIdx = raw.indexOf('Headers:')
       const bodyEnd = headersIdx !== -1
-        ? raw.lastIndexOf('"', headersIdx) - 0   // last " before Headers:
+        ? raw.lastIndexOf('"', headersIdx)   // last " before Headers:
         : raw.indexOf('"\nHeaders:')
       if (bodyStart !== -1 && bodyEnd !== -1 && bodyEnd > bodyStart) {
+        // Body content is a JSON string literal (without surrounding quotes).
+        // Wrap it in quotes and JSON.parse to properly unescape \" \\ \n \t etc.
         const escaped = raw.substring(bodyStart + 7, bodyEnd)
-        // Body uses JSON string escaping: \" → " and \\ → \
-        const unescaped = escaped
-          .replace(/\\\\/g, '\x00') // protect \\ first
-          .replace(/\\"/g, '"')     // unescape \"
-          .replace(/\x00/g, '\\')  // restore \\
-        const parsed = JSON.parse(unescaped)
-        if (typeof parsed?.message === 'string') {
-          detail = parsed.message
+        const bodyStr = JSON.parse('"' + escaped + '"')
+        // bodyStr may be plain text (e.g. 502 Bad Gateway) instead of JSON.
+        // Parse separately so a non-JSON body still yields a friendly message.
+        try {
+          const parsed = JSON.parse(bodyStr)
+          if (typeof parsed?.message === 'string') {
+            detail = parsed.message
+          }
+        } catch {
+          detail = bodyStr
         }
       }
     } catch {
