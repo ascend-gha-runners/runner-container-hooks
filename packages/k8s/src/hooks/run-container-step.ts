@@ -10,6 +10,7 @@ import {
   execCpFromPod,
   execCpToPod,
   execPodStep,
+  formatK8sApiError,
   getContainerTerminatedErrors,
   getPodByName,
   getPrepareJobTimeoutSeconds,
@@ -58,8 +59,8 @@ export async function runContainerStep(
     pod = await createContainerStepPod(getStepPodName(), container, extension)
   } catch (err) {
     core.debug(`createJob failed: ${JSON.stringify(err)}`)
-    const message = (err as any)?.response?.body?.message || err
-    throw new Error(`failed to run script step: ${message}`)
+    const detail = formatK8sApiError(err)
+    throw new Error(`failed to run script step:\n${detail}`)
   }
 
   if (!pod.metadata?.name) {

@@ -94,10 +94,11 @@ describe('runContainerStep terminated error detection', () => {
   })
 
   it('detects OOMKilled and logs describePodFailure output', async () => {
-    const podObj = buildPodWithTerminated([
-      terminatedContainer('job', 'OOMKilled', 137, 'The node was low on resource: memory')
-    ])
-    getPodByNameSpy.mockResolvedValue(podObj)
+    getPodByNameSpy.mockResolvedValue(
+      buildPodWithTerminated([
+        terminatedContainer('job', 'OOMKilled', 137, 'The node was low on resource: memory')
+      ])
+    )
     getContainerTerminatedErrorsSpy.mockReturnValue([
       '  ✗ container "job": OOMKilled (exit code 137)\n    The node was low on resource: memory'
     ])
@@ -106,31 +107,18 @@ describe('runContainerStep terminated error detection', () => {
 
     expect(getPodByNameSpy).toHaveBeenCalledWith('test-step-pod')
     expect(getContainerTerminatedErrorsSpy).toHaveBeenCalled()
-    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod', podObj)
+    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod')
     expect(coreErrorSpy).toHaveBeenCalledWith(
       expect.stringContaining('OOMKilled')
     )
   })
 
-  it('passes pre-fetched pod to describePodFailure to avoid redundant API call', async () => {
-    const podObj = buildPodWithTerminated([
-      terminatedContainer('job', 'OOMKilled', 137, 'The node was low on resource: memory')
-    ])
-    getPodByNameSpy.mockResolvedValue(podObj)
-    getContainerTerminatedErrorsSpy.mockReturnValue([
-      '  ✗ container "job": OOMKilled (exit code 137)\n    The node was low on resource: memory'
-    ])
-
-    await expect(runContainerStep(makeMinimalArgs())).rejects.toThrow()
-
-    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod', podObj)
-  })
-
   it('detects Error (exit non-zero) and logs describePodFailure output', async () => {
-    const podObj = buildPodWithTerminated([
-      terminatedContainer('job', 'Error', 1)
-    ])
-    getPodByNameSpy.mockResolvedValue(podObj)
+    getPodByNameSpy.mockResolvedValue(
+      buildPodWithTerminated([
+        terminatedContainer('job', 'Error', 1)
+      ])
+    )
     getContainerTerminatedErrorsSpy.mockReturnValue([
       '  ✗ container "job": Error (exit code 1)'
     ])
@@ -139,17 +127,18 @@ describe('runContainerStep terminated error detection', () => {
 
     expect(getPodByNameSpy).toHaveBeenCalledWith('test-step-pod')
     expect(getContainerTerminatedErrorsSpy).toHaveBeenCalled()
-    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod', podObj)
+    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod')
     expect(coreErrorSpy).toHaveBeenCalledWith(
       expect.stringContaining('Error (exit code 1)')
     )
   })
 
   it('detects FailedPostStartHookError and logs describePodFailure output', async () => {
-    const podObj = buildPodWithTerminated([
-      terminatedContainer('job', 'FailedPostStartHookError', 137, 'postStart hook failed')
-    ])
-    getPodByNameSpy.mockResolvedValue(podObj)
+    getPodByNameSpy.mockResolvedValue(
+      buildPodWithTerminated([
+        terminatedContainer('job', 'FailedPostStartHookError', 137, 'postStart hook failed')
+      ])
+    )
     getContainerTerminatedErrorsSpy.mockReturnValue([
       '  ✗ container "job": FailedPostStartHookError (exit code 137)\n    postStart hook failed'
     ])
@@ -158,7 +147,7 @@ describe('runContainerStep terminated error detection', () => {
 
     expect(getPodByNameSpy).toHaveBeenCalledWith('test-step-pod')
     expect(getContainerTerminatedErrorsSpy).toHaveBeenCalled()
-    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod', podObj)
+    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod')
     expect(coreErrorSpy).toHaveBeenCalledWith(
       expect.stringContaining('FailedPostStartHookError')
     )

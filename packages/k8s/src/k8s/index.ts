@@ -767,6 +767,40 @@ export function getUnrecoverableTerminatedReasons(): Set<string> {
   return reasons
 }
 
+export function formatK8sApiError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err)
+  try {
+    const bodyStart = raw.indexOf('Body: "')
+    const headersIdx = raw.indexOf('Headers:')
+    const bodyEnd = headersIdx !== -1
+      ? raw.lastIndexOf('"', headersIdx)
+      : raw.length - 1
+    if (bodyStart !== -1 && bodyEnd > bodyStart) {
+      const escaped = raw.substring(bodyStart + 7, bodyEnd)
+      const unescaped = escaped
+        .replace(/\\\\/g, '\x00')
+        .replace(/\\"/g, '"')
+        .replace(/\x00/g, '\\')
+      const parsed = JSON.parse(unescaped)
+      if (parsed?.details?.causes?.length) {
+        const lines: string[] = []
+        for (const cause of parsed.details.causes) {
+          const field = cause.field ? ` (${cause.field})` : ''
+          const causeReason = cause.reason || 'Unknown'
+          const causeMessage = cause.message || ''
+          lines.push(`  ✗ ${causeReason}${field}: ${causeMessage}`)
+        }
+        return lines.join('\n')
+      }
+      if (typeof parsed?.message === 'string') {
+        return parsed.message
+      }
+    }
+  } catch {
+  }
+  return raw
+}
+
 export function getContainerErrors(pod: k8s.V1Pod): string[] {
   const errors: string[] = []
   const unrecoverableReasons = getUnrecoverableWaitingReasons()
