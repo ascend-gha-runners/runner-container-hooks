@@ -107,7 +107,7 @@ describe('runContainerStep terminated error detection', () => {
 
     expect(getPodByNameSpy).toHaveBeenCalledWith('test-step-pod')
     expect(getContainerTerminatedErrorsSpy).toHaveBeenCalled()
-    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod', expect.anything())
+    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod')
     expect(coreErrorSpy).toHaveBeenCalledWith(
       expect.stringContaining('OOMKilled')
     )
@@ -127,7 +127,7 @@ describe('runContainerStep terminated error detection', () => {
 
     expect(getPodByNameSpy).toHaveBeenCalledWith('test-step-pod')
     expect(getContainerTerminatedErrorsSpy).toHaveBeenCalled()
-    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod', expect.anything())
+    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod')
     expect(coreErrorSpy).toHaveBeenCalledWith(
       expect.stringContaining('Error (exit code 1)')
     )
@@ -147,7 +147,7 @@ describe('runContainerStep terminated error detection', () => {
 
     expect(getPodByNameSpy).toHaveBeenCalledWith('test-step-pod')
     expect(getContainerTerminatedErrorsSpy).toHaveBeenCalled()
-    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod', expect.anything())
+    expect(describePodFailureSpy).toHaveBeenCalledWith('test-step-pod')
     expect(coreErrorSpy).toHaveBeenCalledWith(
       expect.stringContaining('FailedPostStartHookError')
     )
