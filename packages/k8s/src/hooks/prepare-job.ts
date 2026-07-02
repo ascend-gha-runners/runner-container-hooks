@@ -10,6 +10,7 @@ import {
 import {
   containerPorts,
   createJobPod,
+  formatK8sApiError,
   isPodContainerAlpine,
   prunePods,
   waitForPodPhases,
@@ -85,43 +86,8 @@ export async function prepareJob(
   } catch (err) {
     await prunePods()
     core.debug(`createPod failed: ${JSON.stringify(err)}`)
-    // The k8s client throws HttpException whose message is a multi-line string
-    // containing the raw HTTP dump. Extract the human-readable "message" field
-    // from the embedded JSON body so the log shows something like:
-    //   failed to create job pod:
-    //     spec.volumes[5].name: Duplicate value: "bad-hostpath"
-    // instead of the full HTTP dump.
-    const raw = err instanceof Error ? err.message : String(err)
-    let detail = raw
-    // The k8s HttpException message is a multi-line dump:
-    //   HTTP-Code: 422
-    //   Body: "{\"kind\":\"Status\",\"message\":\"...\", ...}"
-    //   Headers: {...}
-    // Extract the Body JSON string, unescape it, and pull out "message".
-    try {
-      const bodyStart = raw.indexOf('Body: "')
-      // The boundary may be '"\nHeaders:' (real newline) or the literal
-      // string ends before Headers — use the last '"' before 'Headers:' as fallback
-      const headersIdx = raw.indexOf('Headers:')
-      const bodyEnd = headersIdx !== -1
-        ? raw.lastIndexOf('"', headersIdx) - 0   // last " before Headers:
-        : raw.indexOf('"\nHeaders:')
-      if (bodyStart !== -1 && bodyEnd !== -1 && bodyEnd > bodyStart) {
-        const escaped = raw.substring(bodyStart + 7, bodyEnd)
-        // Body uses JSON string escaping: \" → " and \\ → \
-        const unescaped = escaped
-          .replace(/\\\\/g, '\x00') // protect \\ first
-          .replace(/\\"/g, '"')     // unescape \"
-          .replace(/\x00/g, '\\')  // restore \\
-        const parsed = JSON.parse(unescaped)
-        if (typeof parsed?.message === 'string') {
-          detail = parsed.message
-        }
-      }
-    } catch {
-      // Parsing failed — fall through and show the raw string
-    }
-    throw new Error(`failed to create job pod:\n  ${detail}`)
+    const detail = formatK8sApiError(err)
+    throw new Error(`failed to create job pod:\n${detail}`)
   }
 
   if (!createdPod?.metadata?.name) {

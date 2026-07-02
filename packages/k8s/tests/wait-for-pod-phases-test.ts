@@ -1,6 +1,7 @@
 import * as k8s from '@kubernetes/client-node'
 import {
   describePodFailure,
+  formatK8sApiError,
   getContainerErrors,
   getContainerTerminatedErrors,
   getPodEventErrors,
@@ -400,6 +401,16 @@ describe('getContainerTerminatedErrors', () => {
     })
     expect(getContainerTerminatedErrors(pod)).toEqual([])
   })
+
+  it('ignores terminated containers with exitCode=0 even if reason is in whitelist', () => {
+    const pod = buildPod(PodPhase.SUCCEEDED, {
+      containerStatuses: [
+        terminatedContainer('fs-init', 'Completed', 0),
+        terminatedContainer('job', 'OOMKilled', 0)
+      ]
+    })
+    expect(getContainerTerminatedErrors(pod)).toEqual([])
+  })
 })
 
 describe('getUnrecoverableTerminatedReasons', () => {
@@ -660,5 +671,136 @@ describe('describePodFailure', () => {
 
     const description = await describePodFailure('my-pod')
     expect(description).toContain('Could not read pod my-pod for diagnostics')
+  })
+
+  it('uses pre-fetched pod when provided, skipping readPod call', async () => {
+    const pod = buildPod(PodPhase.FAILED, {
+      containerStatuses: [
+        terminatedContainer('job', 'OOMKilled', 137, 'memory limit exceeded')
+      ]
+    })
+    const description = await describePodFailure('my-pod', pod)
+    expect(description).toContain('Pod status: Failed')
+    expect(description).toContain('OOMKilled (exit code 137)')
+    expect(readSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe('formatK8sApiError', () => {
+  function buildHttpExceptionBody(statusObj: object): string {
+    const escapedBody = JSON.stringify(JSON.stringify(statusObj))
+      .replace(/^"/, '')
+      .replace(/"$/, '')
+    return `HTTP-Code: 422\nMessage: Unknown API Status Code!\nBody: "${escapedBody}"\nHeaders: {"content-type":"application/json"}`
+  }
+
+  it('formats details.causes with ✗ markers for 422 validation errors', () => {
+    const statusObj = {
+      kind: 'Status',
+      apiVersion: 'v1',
+      status: 'Failure',
+      message: 'Pod "test-pod" is invalid: [spec.containers[0].resources.limits: Required value, spec.containers[0].resources.requests: Invalid value]',
+      reason: 'Invalid',
+      details: {
+        name: 'test-pod',
+        kind: 'Pod',
+        causes: [
+          {
+            reason: 'FieldValueRequired',
+            message: 'Required value: Limit must be set for non overcommitable resources',
+            field: 'spec.containers[0].resources.limits'
+          },
+          {
+            reason: 'FieldValueInvalid',
+            message: 'Invalid value: "128Gi": must be less than or equal to memory limit of 16Mi',
+            field: 'spec.containers[0].resources.requests'
+          }
+        ]
+      },
+      code: 422
+    }
+    const err = new Error(buildHttpExceptionBody(statusObj))
+    const result = formatK8sApiError(err)
+    expect(result).toContain('✗ FieldValueRequired (spec.containers[0].resources.limits): Required value: Limit must be set for non overcommitable resources')
+    expect(result).toContain('✗ FieldValueInvalid (spec.containers[0].resources.requests): Invalid value: "128Gi": must be less than or equal to memory limit of 16Mi')
+  })
+
+  it('formats details.causes for FailedScheduling 422 (resource over limit)', () => {
+    const statusObj = {
+      kind: 'Status',
+      apiVersion: 'v1',
+      status: 'Failure',
+      message: 'Pod "test-pod" is invalid',
+      reason: 'Invalid',
+      details: {
+        causes: [
+          {
+            reason: 'FieldValueInvalid',
+            message: 'Invalid value: "999": must be less than or equal to cpu limit of 46',
+            field: 'spec.containers[0].resources.requests'
+          },
+          {
+            reason: 'FieldValueInvalid',
+            message: 'Invalid value: "999Gi": must be less than or equal to memory limit of 128Gi',
+            field: 'spec.containers[0].resources.requests'
+          }
+        ]
+      },
+      code: 422
+    }
+    const err = new Error(buildHttpExceptionBody(statusObj))
+    const result = formatK8sApiError(err)
+    expect(result).toContain('✗ FieldValueInvalid (spec.containers[0].resources.requests): Invalid value: "999": must be less than or equal to cpu limit of 46')
+    expect(result).toContain('✗ FieldValueInvalid (spec.containers[0].resources.requests): Invalid value: "999Gi": must be less than or equal to memory limit of 128Gi')
+  })
+
+  it('falls back to top-level message when there are no causes', () => {
+    const statusObj = {
+      kind: 'Status',
+      apiVersion: 'v1',
+      status: 'Failure',
+      message: 'Pod "test-pod" is forbidden: pod does not exist',
+      reason: 'Forbidden',
+      details: {},
+      code: 403
+    }
+    const err = new Error(buildHttpExceptionBody(statusObj))
+    const result = formatK8sApiError(err)
+    expect(result).toBe('Pod "test-pod" is forbidden: pod does not exist')
+  })
+
+  it('returns raw string when body cannot be parsed', () => {
+    const err = new Error('some network error')
+    const result = formatK8sApiError(err)
+    expect(result).toBe('some network error')
+  })
+
+  it('returns raw string when there is no Body in the message', () => {
+    const err = new Error('HTTP-Code: 500\nMessage: Internal Server Error')
+    const result = formatK8sApiError(err)
+    expect(result).toBe('HTTP-Code: 500\nMessage: Internal Server Error')
+  })
+
+  it('handles causes with missing fields gracefully', () => {
+    const statusObj = {
+      kind: 'Status',
+      details: {
+        causes: [
+          {
+            reason: 'FieldValueRequired',
+            message: 'Required value'
+          }
+        ]
+      },
+      code: 422
+    }
+    const err = new Error(buildHttpExceptionBody(statusObj))
+    const result = formatK8sApiError(err)
+    expect(result).toContain('✗ FieldValueRequired: Required value')
+  })
+
+  it('handles non-Error objects by converting to string', () => {
+    const result = formatK8sApiError('plain string error')
+    expect(result).toBe('plain string error')
   })
 })
