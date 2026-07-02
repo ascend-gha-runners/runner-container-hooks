@@ -10,7 +10,6 @@ import {
 import {
   containerPorts,
   createJobPod,
-  formatK8sApiError,
   isPodContainerAlpine,
   prunePods,
   waitForPodPhases,
@@ -86,8 +85,48 @@ export async function prepareJob(
   } catch (err) {
     await prunePods()
     core.debug(`createPod failed: ${JSON.stringify(err)}`)
-    const detail = formatK8sApiError(err)
-    throw new Error(`failed to create job pod:\n${detail}`)
+    // The k8s client throws HttpException whose message is a multi-line string
+    // containing the raw HTTP dump. Extract the human-readable "message" field
+    // from the embedded JSON body so the log shows something like:
+    //   failed to create job pod:
+    //     spec.volumes[5].name: Duplicate value: "bad-hostpath"
+    // instead of the full HTTP dump.
+    const raw = err instanceof Error ? err.message : String(err)
+    let detail = raw
+    // The k8s HttpException message is a multi-line dump:
+    //   HTTP-Code: 422
+    //   Message: Unknown API Status Code!
+    //   Body: "{\"kind\":\"Status\",\"message\":\"...\\n\"}"
+    //   Headers: {...}
+    // Extract the Body JSON string, unescape it, and pull out "message".
+    try {
+      const bodyStart = raw.indexOf('Body: "')
+      // The boundary may be '"\nHeaders:' (real newline) or the literal
+      // string ends before Headers — use the last '"' before 'Headers:' as fallback
+      const headersIdx = raw.indexOf('Headers:')
+      const bodyEnd = headersIdx !== -1
+        ? raw.lastIndexOf('"', headersIdx)   // last " before Headers:
+        : raw.indexOf('"\nHeaders:')
+      if (bodyStart !== -1 && bodyEnd !== -1 && bodyEnd > bodyStart) {
+        // Body content is a JSON string literal (without surrounding quotes).
+        // Wrap it in quotes and JSON.parse to properly unescape \" \\ \n \t etc.
+        const escaped = raw.substring(bodyStart + 7, bodyEnd)
+        const bodyStr = JSON.parse('"' + escaped + '"')
+        // bodyStr may be plain text (e.g. 502 Bad Gateway) instead of JSON.
+        // Parse separately so a non-JSON body still yields a friendly message.
+        try {
+          const parsed = JSON.parse(bodyStr)
+          if (typeof parsed?.message === 'string') {
+            detail = parsed.message
+          }
+        } catch {
+          detail = bodyStr
+        }
+      }
+    } catch {
+      // Parsing failed — fall through and show the raw string
+    }
+    throw new Error(`failed to create job pod:\n  ${detail}`)
   }
 
   if (!createdPod?.metadata?.name) {
