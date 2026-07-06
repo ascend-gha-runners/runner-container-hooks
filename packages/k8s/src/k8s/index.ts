@@ -305,18 +305,33 @@ export async function execPodStepWithOutput(
     buffer.push(line)
     if (buffer.length > tailLines) buffer.shift()
   }
-  let pending = ''
-  const ingest = (chunk: Buffer | string) => {
-    pending += chunk.toString('utf8')
-    const lines = pending.split(/\r?\n/)
-    pending = lines.pop() ?? ''
+
+  // Separate pending buffers per stream to prevent stdout/stderr interleaving.
+  let pendingOut = ''
+  const ingestOut = (chunk: Buffer | string) => {
+    pendingOut += chunk.toString('utf8')
+    const lines = pendingOut.split(/\r?\n/)
+    pendingOut = lines.pop() ?? ''
     for (const line of lines) push(line)
+  }
+
+  let pendingErr = ''
+  const ingestErr = (chunk: Buffer | string) => {
+    pendingErr += chunk.toString('utf8')
+    const lines = pendingErr.split(/\r?\n/)
+    pendingErr = lines.pop() ?? ''
+    for (const line of lines) push(line)
+  }
+
+  const flushPending = () => {
+    if (pendingOut) { push(pendingOut); pendingOut = '' }
+    if (pendingErr) { push(pendingErr); pendingErr = '' }
   }
 
   const capture = new stream.Writable({
     write(chunk: Buffer | string, _enc, cb) {
       try {
-        ingest(chunk)
+        ingestOut(chunk)
         process.stdout.write(chunk)
         cb()
       } catch (e) {
@@ -327,7 +342,7 @@ export async function execPodStepWithOutput(
   const captureErr = new stream.Writable({
     write(chunk: Buffer | string, _enc, cb) {
       try {
-        ingest(chunk)
+        ingestErr(chunk)
         process.stderr.write(chunk)
         cb()
       } catch (e) {
@@ -335,6 +350,14 @@ export async function execPodStepWithOutput(
       }
     }
   })
+
+  // Parse an exit code from a k8s exec error/status message.
+  // Handles both "command terminated with exit code N" and
+  // "command terminated with non-zero exit code: command terminated with exit code N".
+  const parseExitCode = (msg: string | undefined): number | null => {
+    const m = msg?.match(/exit code[:\s]+(\d+)/i)
+    return m ? parseInt(m[1], 10) : null
+  }
 
   return await new Promise(function (resolve, reject) {
     exec
@@ -349,33 +372,37 @@ export async function execPodStepWithOutput(
         false /* tty */,
         resp => {
           core.debug(`execPodStepWithOutput response: ${JSON.stringify(resp)}`)
-          // Flush any trailing partial line.
-          if (pending) {
-            push(pending)
-            pending = ''
-          }
+          flushPending()
           if (resp.status === 'Success') {
             resolve({ code: resp.code || 0, output: buffer.join('\n') })
           } else {
-            // k8s exec returns status='Failure' for any non-zero script exit.
-            // resp.code may be undefined in some k8s versions; parse the exit
-            // code from the message instead ("command terminated with exit code N").
-            const exitMatch = resp?.message?.match(/exit code[:\s]+(\d+)/i)
-            if (exitMatch) {
-              resolve({
-                code: parseInt(exitMatch[1], 10),
-                output: buffer.join('\n')
-              })
+            // k8s exec returns status='Failure' for non-zero script exit.
+            // resp.code may be undefined depending on k8s version; fall back
+            // to parsing the exit code from the message string.
+            const code = parseExitCode(resp?.message)
+            if (code !== null) {
+              resolve({ code, output: buffer.join('\n') })
             } else {
-              // Genuine exec failure: websocket drop, setup error, etc.
-              reject(
-                new Error(resp?.message || 'execPodStepWithOutput failed')
-              )
+              reject(new Error(resp?.message || 'execPodStepWithOutput failed'))
             }
           }
         }
       )
-      .catch(e => reject(e))
+      .catch(e => {
+        // In @kubernetes/client-node v1.x the promise returned by exec()
+        // itself rejects for non-zero exits (the status callback may or may
+        // not fire first). Detect this case via the error message so the
+        // caller can classify the error instead of treating it as a hook
+        // failure. Genuine failures (connection drop, etc.) still reject.
+        flushPending()
+        const errMsg = e instanceof Error ? e.message : String(e)
+        const code = parseExitCode(errMsg)
+        if (code !== null) {
+          resolve({ code, output: buffer.join('\n') })
+        } else {
+          reject(e)
+        }
+      })
   })
 }
 
