@@ -194,20 +194,28 @@ async function classifyScriptError(
       if (isContainerFault) {
         const detail = term.message ? `\n    ${term.message}` : ''
         errors.push(
-          `  ✗ container "${JOB_CONTAINER_NAME}": ${reason} (exit code ${term.exitCode}) — container-level failure${detail}`
+          `  ✗ container "${JOB_CONTAINER_NAME}": ${reason} (exit code ${term.exitCode}) — container-level failure, not a script error${detail}`
         )
       } else {
+        errors.push(
+          `  → container exited cleanly; check your script for errors`
+        )
         sections.push(
-          `Container status: ${reason} (exit code ${term.exitCode}) — your script returned non-zero`
+          `Container status: ${reason} (exit code ${term.exitCode})`
         )
       }
-    } else if (cs?.state?.waiting) {
+    } else {
+      // Container state unavailable — treat as script issue by default
+      errors.push(`  → check your script for errors`)
+    }
+    if (cs?.state?.waiting) {
       errors.push(
         `  ✗ container "${JOB_CONTAINER_NAME}" waiting: ${cs.state.waiting.reason ?? 'unknown'}`
       )
     }
   } catch {
-    // pod already gone or API error; omit container section
+    // pod already gone or API error — default hint
+    errors.push(`  → check your script for errors`)
   }
 
   if (tailOutput) {
