@@ -371,7 +371,7 @@ export async function execPodStepWithOutput(
         stdin ?? null,
         false /* tty */,
         resp => {
-          core.debug(`execPodStepWithOutput response: ${JSON.stringify(resp)}`)
+          core.warning(`[diag] execPodStepWithOutput callback: status=${resp?.status} code=${resp?.code} msg=${resp?.message}`)
           flushPending()
           if (resp.status === 'Success') {
             resolve({ code: resp.code || 0, output: buffer.join('\n') })
@@ -380,6 +380,7 @@ export async function execPodStepWithOutput(
             // resp.code may be undefined depending on k8s version; fall back
             // to parsing the exit code from the message string.
             const code = parseExitCode(resp?.message)
+            core.warning(`[diag] callback Failure: parseExitCode=${code}`)
             if (code !== null) {
               resolve({ code, output: buffer.join('\n') })
             } else {
@@ -397,9 +398,12 @@ export async function execPodStepWithOutput(
         flushPending()
         const errMsg = e instanceof Error ? e.message : String(e)
         const code = parseExitCode(errMsg)
+        core.warning(`[diag] exec() .catch(): errMsg="${errMsg}" parseExitCode=${code}`)
         if (code !== null) {
+          core.warning(`[diag] .catch() resolving with code=${code}`)
           resolve({ code, output: buffer.join('\n') })
         } else {
+          core.warning(`[diag] .catch() rejecting`)
           reject(e)
         }
       })

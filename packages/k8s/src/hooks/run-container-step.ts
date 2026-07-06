@@ -106,11 +106,13 @@ export async function runContainerStep(
 
     try {
       core.debug(`Executing container step script in pod ${podName}`)
+      core.warning(`[diag] calling execPodStepWithOutput on pod ${pod.metadata.name}`)
       const { code, output } = await execPodStepWithOutput(
         ['sh', '-e', containerPath],
         pod.metadata.name,
         JOB_CONTAINER_NAME
       )
+      core.warning(`[diag] execPodStepWithOutput resolved: code=${code} outputLen=${output.length}`)
       if (code === 0) {
         return 0
       }
