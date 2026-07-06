@@ -356,11 +356,18 @@ export async function execPodStepWithOutput(
           }
           if (resp.status === 'Success') {
             resolve({ code: resp.code || 0, output: buffer.join('\n') })
+          } else if (
+            resp.status === 'Failure' &&
+            typeof resp.code === 'number'
+          ) {
+            // Non-zero exit from the script: resolve with the exit code so the
+            // caller can classify the error rather than treating it as a hook
+            // failure. resp.message is "command terminated with exit code N".
+            resolve({ code: resp.code, output: buffer.join('\n') })
           } else {
+            // Unexpected failure (exec setup error, websocket drop, etc.)
             reject(
-              new Error(
-                resp?.message || 'execPodStepWithOutput failed'
-              )
+              new Error(resp?.message || 'execPodStepWithOutput failed')
             )
           }
         }
