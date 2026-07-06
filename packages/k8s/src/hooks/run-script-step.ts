@@ -12,7 +12,7 @@ function formatScriptError(exitCode: number, tailOutput: string): string {
   const sep = '─'.repeat(60)
   const errors = [
     `  ✗ exit code: ${exitCode}`,
-    `  → your script exited with a non-zero code; check your script for errors`
+    `  → your script exited with a non-zero code; please check your script for errors`
   ]
   const sections: string[] = []
   if (tailOutput) {

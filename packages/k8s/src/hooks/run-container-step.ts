@@ -121,7 +121,6 @@ export async function runContainerStep(
       const classification = await classifyScriptError(
         pod.metadata.name,
         code,
-        stepContainer.entryPoint,
         output
       )
       throw new Error(classification)
@@ -171,7 +170,6 @@ export async function runContainerStep(
 async function classifyScriptError(
   podName: string,
   exitCode: number,
-  entryPoint: string,
   tailOutput: string
 ): Promise<string> {
   const sep = '─'.repeat(60)
@@ -198,7 +196,7 @@ async function classifyScriptError(
         )
       } else {
         errors.push(
-          `  → container exited cleanly; check your script for errors`
+          `  → container exited cleanly; please check your script for errors`
         )
         sections.push(
           `Container status: ${reason} (exit code ${term.exitCode})`
@@ -206,7 +204,7 @@ async function classifyScriptError(
       }
     } else {
       // Container state unavailable — treat as script issue by default
-      errors.push(`  → check your script for errors`)
+      errors.push(`  → please check your script for errors`)
     }
     if (cs?.state?.waiting) {
       errors.push(
@@ -215,7 +213,7 @@ async function classifyScriptError(
     }
   } catch {
     // pod already gone or API error — default hint
-    errors.push(`  → check your script for errors`)
+    errors.push(`  → please check your script for errors`)
   }
 
   if (tailOutput) {
