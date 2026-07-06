@@ -164,23 +164,20 @@ export async function runContainerStep(
 
 // Inspect the pod's container status to determine whether a non-zero exit
 // code came from the user's script (container terminated cleanly with
-// reason=Completed) or from a container-level failure (OOMKilled, segfault,
-// etc.). The container state may not yet be 'terminated' when this is called
-// (k8s updates it asynchronously after the process exits), so we treat any
-// state where we cannot positively confirm a container-level failure as a
-// script issue and let the user re-check their script first.
+// reason=Completed) or from a container-level failure (OOMKilled, etc.).
+// The container state may not yet be 'terminated' when called (k8s updates
+// it asynchronously), so we default to treating unknown state as a script
+// issue and let the user check their script first.
 async function classifyScriptError(
   podName: string,
   exitCode: number,
   entryPoint: string,
   tailOutput: string
 ): Promise<string> {
-  const lines: string[] = [
-    `Step failed: script execution (exit code ${exitCode})`,
-    `  entryPoint: ${entryPoint}`
-  ]
+  const sep = '─'.repeat(60)
+  const errors: string[] = [`  ✗ exit code: ${exitCode}`]
+  const sections: string[] = []
 
-  let containerHint = '  container: state unavailable — likely a script issue'
   try {
     const pod = await getPodByName(podName)
     const cs = pod.status?.containerStatuses?.find(
@@ -195,28 +192,37 @@ async function classifyScriptError(
         reason === 'FailedPostStartHookError' ||
         (term.exitCode === 137 && reason !== 'Completed')
       if (isContainerFault) {
-        containerHint = `  container: terminated: ${reason} (exit code ${term.exitCode}) — container-level failure, not your script`
+        const detail = term.message ? `\n    ${term.message}` : ''
+        errors.push(
+          `  ✗ container "${JOB_CONTAINER_NAME}": ${reason} (exit code ${term.exitCode}) — container-level failure${detail}`
+        )
       } else {
-        containerHint = `  container: terminated: ${reason} (exit code ${term.exitCode}) — container exited cleanly, your script returned a non-zero code`
+        sections.push(
+          `Container status: ${reason} (exit code ${term.exitCode}) — your script returned non-zero`
+        )
       }
     } else if (cs?.state?.waiting) {
-      containerHint = `  container: waiting: ${cs.state.waiting.reason ?? 'unknown'} — container-level issue`
-    } else if (cs?.state?.running) {
-      containerHint =
-        '  container: still running — script may have backgrounded a process; check your script'
+      errors.push(
+        `  ✗ container "${JOB_CONTAINER_NAME}" waiting: ${cs.state.waiting.reason ?? 'unknown'}`
+      )
     }
   } catch {
-    // pod already gone or API error; keep the default hint
+    // pod already gone or API error; omit container section
   }
-  lines.push(containerHint)
 
   if (tailOutput) {
-    lines.push('  last output:')
-    for (const outLine of tailOutput.split('\n')) {
-      lines.push(`    ${outLine}`)
-    }
+    const outputLines = tailOutput
+      .split('\n')
+      .map(l => `  ${l}`)
+      .join('\n')
+    sections.push(`Last output:\n${outputLines}`)
   }
-  return lines.join('\n')
+
+  let result = `failed to run script step:\n${errors.join('\n')}`
+  if (sections.length) {
+    result += `\n${sep}\n${sections.join('\n')}`
+  }
+  return result
 }
 
 function createContainerSpec(

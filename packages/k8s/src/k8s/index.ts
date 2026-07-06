@@ -356,19 +356,22 @@ export async function execPodStepWithOutput(
           }
           if (resp.status === 'Success') {
             resolve({ code: resp.code || 0, output: buffer.join('\n') })
-          } else if (
-            resp.status === 'Failure' &&
-            typeof resp.code === 'number'
-          ) {
-            // Non-zero exit from the script: resolve with the exit code so the
-            // caller can classify the error rather than treating it as a hook
-            // failure. resp.message is "command terminated with exit code N".
-            resolve({ code: resp.code, output: buffer.join('\n') })
           } else {
-            // Unexpected failure (exec setup error, websocket drop, etc.)
-            reject(
-              new Error(resp?.message || 'execPodStepWithOutput failed')
-            )
+            // k8s exec returns status='Failure' for any non-zero script exit.
+            // resp.code may be undefined in some k8s versions; parse the exit
+            // code from the message instead ("command terminated with exit code N").
+            const exitMatch = resp?.message?.match(/exit code[:\s]+(\d+)/i)
+            if (exitMatch) {
+              resolve({
+                code: parseInt(exitMatch[1], 10),
+                output: buffer.join('\n')
+              })
+            } else {
+              // Genuine exec failure: websocket drop, setup error, etc.
+              reject(
+                new Error(resp?.message || 'execPodStepWithOutput failed')
+              )
+            }
           }
         }
       )
