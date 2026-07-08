@@ -817,9 +817,13 @@ export const UNRECOVERABLE_WAITING_REASONS = new Set([
 //     Secret/ConfigMap volume). The container stays in `ContainerCreating`
 //     waiting state, which is NOT in UNRECOVERABLE_WAITING_REASONS, so without
 //     this check the hook polls until the 3600s timeout.
-//   - FailedScheduling: the scheduler cannot place the pod (insufficient
-//     cpu/memory/gpu, node selector / affinity mismatch, no matching nodes).
-//     The pod stays Pending with PodScheduled=False forever.
+//   - FailedScheduling: the scheduler cannot place the pod. Only treated as
+//     unrecoverable when the message indicates a *permanent* configuration
+//     mismatch (e.g. node selector / taint / topology mismatch). When the
+//     message indicates a *transient* resource shortage ("Insufficient cpu",
+//     "didn't match Pod's node affinity/selector" due to label absence, etc.)
+//     we let the pod keep queuing until the timeout -- a node may free up or
+//     a new node may join. See isTransientSchedulingFailure() for the heuristic.
 //   - FailedBinding: a PVC could not be bound (no matching PV, storage class
 //     misconfiguration). Usually paired with FailedMount once the pod retries.
 export const UNRECOVERABLE_EVENT_REASONS = new Set([
@@ -833,6 +837,41 @@ export const UNRECOVERABLE_TERMINATED_REASONS = new Set([
   'Error',
   'FailedPostStartHookError'
 ])
+
+// Patterns that POSITIVELY IDENTIFY a permanent, unrecoverable scheduling
+// configuration error in a FailedScheduling event or Unschedulable condition
+// message. Fast-fail is triggered ONLY when one of these matches.
+//
+// Conservative by design: when a message is absent, empty, or does not match
+// any pattern we treat it as transient and let the pod keep queuing until the
+// timeout fires. This avoids false-positive fast-fails on:
+//   - Resource shortages ("Insufficient cpu/memory/gpu") that self-resolve
+//   - New or unknown kube-scheduler message formats
+//   - Scheduler messages that change across Kubernetes versions
+//
+// Examples of permanent messages (WILL fast-fail):
+//   "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."
+//   "0/3 nodes are available: 3 node(s) had untolerated taint {key: value}."
+//
+// Examples of messages that will NOT fast-fail (queue until timeout instead):
+//   "0/3 nodes are available: 3 Insufficient nvidia.com/gpu."   ← resource wait
+//   "0/3 nodes are available: 3 Insufficient memory."           ← resource wait
+//   "0/1 nodes are available"                                   ← unknown/ambiguous
+//   (no message)                                                ← unknown
+//
+// To fast-fail on additional patterns without a code change, set env var
+// ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS to a comma-separated list
+// of regular-expression strings (added to this set; cannot remove entries).
+export const PERMANENT_SCHEDULING_PATTERNS: readonly RegExp[] = [
+  // Node selector / affinity label mismatch — the pod's nodeSelector or
+  // nodeAffinity requires labels that no node in the cluster has. Will not
+  // self-resolve without a pod-spec or node-label change.
+  /node\(s\) didn't match Pod's node affinity\/selector/i,
+  /node\(s\) didn't match node affinity/i,
+  // Untolerated taint — every node carries a taint the pod does not tolerate.
+  // Will not self-resolve without adding a toleration or removing the taint.
+  /node\(s\) had untolerated taint/i,
+]
 
 // Maximum number of Warning events to include in a pod's failure description so
 // that the GitHub Actions log is not flooded.
@@ -927,16 +966,57 @@ export function getContainerTerminatedErrors(pod: k8s.V1Pod): string[] {
   return errors
 }
 
+// Returns true when a FailedScheduling event message or Unschedulable condition
+// message positively identifies a permanent, unrecoverable configuration error.
+// Returns false (treat as transient, keep queuing) for:
+//   - absent/empty messages         → unknown, assume transient
+//   - resource shortages            → Insufficient cpu/memory/gpu/etc.
+//   - any unrecognised message      → unknown, assume transient
+//
+// Used by getPodConditionErrors and getPodEventErrors.  Extend the match set
+// at runtime via ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS (CSV regexes).
+export function isPermanentSchedulingFailure(message: string | undefined): boolean {
+  if (!message) {
+    // No message → cannot confirm permanent → treat as transient (safe default).
+    return false
+  }
+  const patterns = getPermanentSchedulingPatterns()
+  return patterns.some(p => p.test(message))
+}
+
+// Returns the PERMANENT_SCHEDULING_PATTERNS set extended by any extra patterns
+// supplied via the ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS env var
+// (comma-separated list of regular expression strings, e.g. "my pattern,other").
+// Invalid regex strings are skipped with a warning.
+export function getPermanentSchedulingPatterns(): readonly RegExp[] {
+  const extra = process.env['ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS']
+  if (!extra) {
+    return PERMANENT_SCHEDULING_PATTERNS
+  }
+  const patterns: RegExp[] = [...PERMANENT_SCHEDULING_PATTERNS]
+  for (const raw of extra.split(',')) {
+    const trimmed = raw.trim()
+    if (!trimmed) continue
+    try {
+      patterns.push(new RegExp(trimmed, 'i'))
+    } catch {
+      core.warning(
+        `ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS: invalid regex "${trimmed}", skipped`
+      )
+    }
+  }
+  return patterns
+}
+
 // Inspects the pod's status.conditions for deterministic scheduling failures.
 // This is the RBAC-free companion to getPodEventErrors: pod conditions are
 // always readable without the optional 'events' list permission.
 //
-//   PodScheduled=False/Unschedulable: no node matched the pod's requirements
-//   (nodeSelector mismatch, insufficient resources). The scheduler sets this
-//   condition almost immediately and continues retrying. Self-healing IS
-//   possible (a node might free up), so this is a fallback used only when
-//   getPodEventErrors returns nothing (events RBAC unavailable). When events
-//   ARE available, the FailedScheduling event fires first and gates by count.
+//   PodScheduled=False/Unschedulable: the scheduler could not place the pod.
+//   Fast-fail is triggered ONLY when the condition message positively matches
+//   a known-permanent error (see isPermanentSchedulingFailure). Resource
+//   shortages, absent messages, and any unrecognised message are treated as
+//   transient -- the pod keeps queuing until the timeout.
 //
 // Never throws; on any unexpected error it returns [].
 export function getPodConditionErrors(pod: k8s.V1Pod): string[] {
@@ -947,6 +1027,14 @@ export function getPodConditionErrors(pod: k8s.V1Pod): string[] {
       cond.status === 'False' &&
       cond.reason === 'Unschedulable'
     ) {
+      // Only fast-fail on confirmed permanent config errors; everything else
+      // (Insufficient resources, unknown message, no message) keeps queuing.
+      if (!isPermanentSchedulingFailure(cond.message)) {
+        core.debug(
+          `[fast-fail] Skipping Unschedulable condition (not a recognised permanent failure): ${cond.message ?? '(no message)'}`
+        )
+        continue
+      }
       const msg = cond.message ? `\n    ${cond.message}` : ''
       errors.push(`  ✗ condition: ${cond.type}=False (${cond.reason})${msg}`)
     }
@@ -987,6 +1075,18 @@ export async function getPodEventErrors(podName: string): Promise<string[]> {
   const seenReasons = new Set<string>()
   for (const e of items) {
     if (e.type !== 'Warning' || !e.reason || !unrecoverableReasons.has(e.reason)) {
+      continue
+    }
+    // For FailedScheduling: only fast-fail when the message positively matches
+    // a known-permanent config error (node affinity/selector mismatch, untolerated
+    // taint). Resource shortages ("Insufficient *"), absent messages, and any
+    // unrecognised format are treated as transient -- let the pod keep queuing.
+    if (e.reason === 'FailedScheduling' && !isPermanentSchedulingFailure(e.message)) {
+      core.debug(
+        `[fast-fail] Skipping FailedScheduling (not recognised as permanent): ${
+          e.message ?? '(no message)'
+        }`
+      )
       continue
     }
     if (seenReasons.has(e.reason)) {
@@ -1159,7 +1259,29 @@ export async function waitForPodPhases(
   const backOffManager = new BackOffManager(maxTimeSeconds)
   let phase: PodPhase = PodPhase.UNKNOWN
   while (true) {
-    const pod = await readPod(podName)
+    let pod: k8s.V1Pod
+    try {
+      pod = await readPod(podName)
+    } catch (err) {
+      // Transient API error (network blip, API server busy): log and back off
+      // rather than crashing the loop. The timeout will eventually fire if the
+      // pod stays permanently unreadable (e.g. RBAC issue).
+      core.warning(
+        `[waitForPodPhases] Could not read pod ${podName}, will retry after backoff: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      )
+      try {
+        await backOffManager.backOff()
+      } catch {
+        throw new Error(
+          `Pod ${podName} timed out after ${maxTimeSeconds}s (pod read failed: ${
+            err instanceof Error ? err.message : String(err)
+          })\n${'─'.repeat(60)}\n(pod was unreadable; no further diagnostics available)`
+        )
+      }
+      continue
+    }
     phase = parsePodPhase(pod)
     if (awaitingPhases.has(phase)) {
       return

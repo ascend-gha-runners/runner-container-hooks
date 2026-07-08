@@ -3,11 +3,14 @@ import {
   describePodFailure,
   getContainerErrors,
   getContainerTerminatedErrors,
+  getPodConditionErrors,
   getPodEventErrors,
   getUnrecoverableEventReasons,
   getUnrecoverableTerminatedReasons,
   getUnrecoverableWaitingReasons,
+  isPermanentSchedulingFailure,
   parsePodPhase,
+  PERMANENT_SCHEDULING_PATTERNS,
   UNRECOVERABLE_EVENT_REASONS,
   UNRECOVERABLE_TERMINATED_REASONS,
   UNRECOVERABLE_WAITING_REASONS,
@@ -205,16 +208,33 @@ describe('getPodEventErrors', () => {
     ])
   })
 
-  it('detects every unrecoverable event reason', async () => {
+  it('detects FailedScheduling with a known-permanent message', async () => {
+    const permanentMsg =
+      "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."
+    eventSpy.mockResolvedValue(
+      eventResult([buildEvent('FailedScheduling', permanentMsg)])
+    )
+    expect(await getPodEventErrors('my-pod')).toEqual([
+      `  ✗ event: FailedScheduling\n    ${permanentMsg}`
+    ])
+  })
+
+  it('does NOT fast-fail on FailedScheduling with ambiguous/unknown message', async () => {
+    // "0/1 nodes are available" has no detail — unknown cause → queue until timeout
+    eventSpy.mockResolvedValue(
+      eventResult([buildEvent('FailedScheduling', '0/1 nodes are available')])
+    )
+    expect(await getPodEventErrors('my-pod')).toEqual([])
+  })
+
+  it('detects FailedBinding and FailedMount (always unrecoverable)', async () => {
     eventSpy.mockResolvedValue(
       eventResult([
-        buildEvent('FailedScheduling', '0/1 nodes are available'),
         buildEvent('FailedBinding', 'no persistent volumes available'),
         buildEvent('FailedMount', 'volume not found')
       ])
     )
     expect(await getPodEventErrors('my-pod')).toEqual([
-      '  ✗ event: FailedScheduling\n    0/1 nodes are available',
       '  ✗ event: FailedBinding\n    no persistent volumes available',
       '  ✗ event: FailedMount\n    volume not found'
     ])
@@ -249,6 +269,54 @@ describe('getPodEventErrors', () => {
     expect(await getPodEventErrors('my-pod')).toEqual([
       '  ✗ event: FailedPreStopHook\n    hook failed'
     ])
+  })
+
+  it('does NOT fast-fail on FailedScheduling events with Insufficient resources', async () => {
+    // Transient: a node may free up -- let the pod keep queuing.
+    for (const message of [
+      '0/3 nodes are available: 3 Insufficient nvidia.com/gpu.',
+      '0/5 nodes are available: 5 Insufficient memory.',
+      '0/2 nodes are available: 2 Insufficient cpu.'
+    ]) {
+      eventSpy.mockResolvedValue(
+        eventResult([buildEvent('FailedScheduling', message)])
+      )
+      expect(await getPodEventErrors('my-pod')).toEqual([])
+    }
+  })
+
+  it('fast-fails on FailedScheduling events with permanent config errors', async () => {
+    // Permanent: node selector mismatch / taint will not resolve on its own.
+    for (const message of [
+      "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.",
+      '0/3 nodes are available: 3 node(s) had untolerated taint {key: value}.'
+    ]) {
+      eventSpy.mockResolvedValue(
+        eventResult([buildEvent('FailedScheduling', message)])
+      )
+      expect(await getPodEventErrors('my-pod')).toEqual([
+        `  ✗ event: FailedScheduling\n    ${message}`
+      ])
+    }
+  })
+
+  it('fast-fails when FailedScheduling events are mixed (transient + permanent)', async () => {
+    // One resource-shortage event (skipped) + one permanent config error:
+    // the permanent one surfaces because the transient one is skipped before
+    // the seenReasons dedup, so it does not consume the FailedScheduling slot.
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedScheduling', '0/3 nodes are available: 3 Insufficient cpu.'),
+        buildEvent(
+          'FailedScheduling',
+          "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."
+        )
+      ])
+    )
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors.length).toBe(1)
+    expect(errors[0]).toContain('FailedScheduling')
+    expect(errors[0]).toContain("didn't match Pod's node affinity/selector")
   })
 
   it('degrades gracefully when listing events is forbidden', async () => {
@@ -445,6 +513,132 @@ describe('getUnrecoverableTerminatedReasons', () => {
   })
 })
 
+describe('isPermanentSchedulingFailure', () => {
+  it('returns true for known-permanent config errors', () => {
+    expect(
+      isPermanentSchedulingFailure(
+        "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."
+      )
+    ).toBe(true)
+    expect(
+      isPermanentSchedulingFailure(
+        '0/3 nodes are available: 3 node(s) had untolerated taint {key: value}.'
+      )
+    ).toBe(true)
+    expect(
+      isPermanentSchedulingFailure(
+        "0/5 nodes are available: 5 node(s) didn't match node affinity."
+      )
+    ).toBe(true)
+  })
+
+  it('returns false for resource shortages (transient)', () => {
+    expect(
+      isPermanentSchedulingFailure(
+        '0/3 nodes are available: 3 Insufficient nvidia.com/gpu.'
+      )
+    ).toBe(false)
+    expect(
+      isPermanentSchedulingFailure('0/5 nodes are available: 5 Insufficient memory.')
+    ).toBe(false)
+    expect(
+      isPermanentSchedulingFailure('0/2 nodes are available: 2 Insufficient cpu.')
+    ).toBe(false)
+  })
+
+  it('returns false for ambiguous/unknown messages (safe default: keep queuing)', () => {
+    // No detail → unknown → do not fast-fail
+    expect(isPermanentSchedulingFailure('0/1 nodes are available')).toBe(false)
+    // Unrecognised new scheduler message → unknown → do not fast-fail
+    expect(
+      isPermanentSchedulingFailure('preemption: 0/3 nodes are available')
+    ).toBe(false)
+  })
+
+  it('returns false when message is undefined (safe default: keep queuing)', () => {
+    // Unknown reason → assume transient → do not fast-fail
+    expect(isPermanentSchedulingFailure(undefined)).toBe(false)
+  })
+
+  it('PERMANENT_SCHEDULING_PATTERNS is non-empty', () => {
+    expect(PERMANENT_SCHEDULING_PATTERNS.length).toBeGreaterThan(0)
+  })
+})
+
+describe('getPodConditionErrors', () => {
+  it('returns empty when no conditions', () => {
+    expect(getPodConditionErrors({} as k8s.V1Pod)).toEqual([])
+    expect(getPodConditionErrors(buildPod(PodPhase.PENDING))).toEqual([])
+  })
+
+  it('returns error for known-permanent Unschedulable (node affinity/selector mismatch)', () => {
+    const pod = {
+      status: {
+        conditions: [
+          {
+            type: 'PodScheduled',
+            status: 'False',
+            reason: 'Unschedulable',
+            message: "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."
+          }
+        ]
+      }
+    } as k8s.V1Pod
+    const errors = getPodConditionErrors(pod)
+    expect(errors.length).toBe(1)
+    expect(errors[0]).toContain('condition: PodScheduled=False (Unschedulable)')
+  })
+
+  it('skips Unschedulable with resource shortage (Insufficient)', () => {
+    const pod = {
+      status: {
+        conditions: [
+          {
+            type: 'PodScheduled',
+            status: 'False',
+            reason: 'Unschedulable',
+            message: '0/3 nodes are available: 3 Insufficient nvidia.com/gpu.'
+          }
+        ]
+      }
+    } as k8s.V1Pod
+    expect(getPodConditionErrors(pod)).toEqual([])
+  })
+
+  it('skips Unschedulable with unknown/ambiguous message (safe default: keep queuing)', () => {
+    for (const message of [
+      '0/1 nodes are available',    // no detail — unknown cause
+      undefined                      // no message — unknown cause
+    ]) {
+      const pod = {
+        status: {
+          conditions: [
+            {
+              type: 'PodScheduled',
+              status: 'False',
+              reason: 'Unschedulable',
+              message
+            }
+          ]
+        }
+      } as k8s.V1Pod
+      expect(getPodConditionErrors(pod)).toEqual([])
+    }
+  })
+
+  it('skips conditions that are not PodScheduled=False/Unschedulable', () => {
+    const pod = {
+      status: {
+        conditions: [
+          { type: 'Ready', status: 'False', reason: 'ContainersNotReady' },
+          { type: 'PodScheduled', status: 'True', reason: '' }
+        ]
+      }
+    } as k8s.V1Pod
+    expect(getPodConditionErrors(pod)).toEqual([])
+  })
+})
+
 describe('waitForPodPhases', () => {
   let readSpy: jest.SpyInstance
   let eventSpy: jest.SpyInstance
@@ -531,10 +725,12 @@ describe('waitForPodPhases', () => {
     )
   })
 
-  it('fast-fails on FailedScheduling events', async () => {
+  it('fast-fails on FailedScheduling with known-permanent config error', async () => {
     readSpy.mockResolvedValue(podResult(buildPod(PodPhase.PENDING)))
+    const permanentMsg =
+      "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."
     eventSpy.mockResolvedValue(
-      eventResult([buildEvent('FailedScheduling', '0/1 nodes are available')])
+      eventResult([buildEvent('FailedScheduling', permanentMsg)])
     )
 
     await expect(
@@ -543,7 +739,47 @@ describe('waitForPodPhases', () => {
         new Set([PodPhase.RUNNING]),
         new Set([PodPhase.PENDING])
       )
-    ).rejects.toThrow(/event: FailedScheduling[\s\S]*0\/1 nodes are available/)
+    ).rejects.toThrow(/event: FailedScheduling[\s\S]*node affinity\/selector/)
+  })
+
+  it('does NOT fast-fail on FailedScheduling with ambiguous message (keeps polling)', async () => {
+    // FailedScheduling with unknown message → NOT fast-fail.
+    // Pod transitions to Running on the second poll — proves the loop kept going
+    // rather than throwing an "unrecoverable errors" exception after the first poll.
+    readSpy
+      .mockResolvedValueOnce(podResult(buildPod(PodPhase.PENDING)))
+      .mockResolvedValueOnce(podResult(buildPod(PodPhase.RUNNING)))
+    eventSpy.mockResolvedValue(
+      eventResult([buildEvent('FailedScheduling', '0/1 nodes are available')])
+    )
+
+    // If the ambiguous FailedScheduling caused a fast-fail this would reject.
+    // It must resolve because the pod eventually reached Running.
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).resolves.toBeUndefined()
+  })
+
+  it('retries on transient readPod failure and recovers when pod becomes ready', async () => {
+    // Risk A fix: a transient readPod error must NOT crash the loop immediately.
+    // Pod read fails twice, then returns Running — function must resolve.
+    readSpy
+      .mockRejectedValueOnce(new Error('connection refused') as never)
+      .mockRejectedValueOnce(new Error('connection refused') as never)
+      .mockResolvedValue(podResult(buildPod(PodPhase.RUNNING)))
+    // eventSpy already returns [] from beforeEach
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).resolves.toBeUndefined()
   })
 
   it('throws with the phase when the pod is in a non-backoff phase', async () => {
