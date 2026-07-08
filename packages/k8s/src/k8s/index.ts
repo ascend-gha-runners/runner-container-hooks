@@ -283,6 +283,129 @@ export async function execPodStep(
   })
 }
 
+// Variant of execPodStep that also captures the last `tailLines` lines of
+// combined stdout/stderr so callers can surface the script's own output on
+// failure. Returns the exit code plus the tail (empty string on success or if
+// nothing was emitted). The original streams are still tee'd to
+// process.stdout/process.stderr so GitHub Actions logs are unchanged.
+export async function execPodStepWithOutput(
+  command: string[],
+  podName: string,
+  containerName: string,
+  tailLines = 20,
+  stdin?: stream.Readable
+): Promise<{ code: number; output: string }> {
+  const exec = new k8s.Exec(kc)
+  command = fixArgs(command)
+
+  // Ring buffer of the last N non-empty lines (cap to keep memory bounded).
+  const buffer: string[] = []
+  const push = (line: string) => {
+    if (line.length === 0) return
+    buffer.push(line)
+    if (buffer.length > tailLines) buffer.shift()
+  }
+
+  // Separate pending buffers per stream to prevent stdout/stderr interleaving.
+  let pendingOut = ''
+  const ingestOut = (chunk: Buffer | string) => {
+    pendingOut += chunk.toString('utf8')
+    const lines = pendingOut.split(/\r?\n/)
+    pendingOut = lines.pop() ?? ''
+    for (const line of lines) push(line)
+  }
+
+  let pendingErr = ''
+  const ingestErr = (chunk: Buffer | string) => {
+    pendingErr += chunk.toString('utf8')
+    const lines = pendingErr.split(/\r?\n/)
+    pendingErr = lines.pop() ?? ''
+    for (const line of lines) push(line)
+  }
+
+  const flushPending = () => {
+    if (pendingOut) { push(pendingOut); pendingOut = '' }
+    if (pendingErr) { push(pendingErr); pendingErr = '' }
+  }
+
+  const capture = new stream.Writable({
+    write(chunk: Buffer | string, _enc, cb) {
+      try {
+        ingestOut(chunk)
+        process.stdout.write(chunk)
+        cb()
+      } catch (e) {
+        cb(e as Error)
+      }
+    }
+  })
+  const captureErr = new stream.Writable({
+    write(chunk: Buffer | string, _enc, cb) {
+      try {
+        ingestErr(chunk)
+        process.stderr.write(chunk)
+        cb()
+      } catch (e) {
+        cb(e as Error)
+      }
+    }
+  })
+
+  // Parse an exit code from a k8s exec error/status message.
+  // Handles both "command terminated with exit code N" and
+  // "command terminated with non-zero exit code: command terminated with exit code N".
+  const parseExitCode = (msg: string | undefined): number | null => {
+    const m = msg?.match(/exit code[:\s]+(\d+)/i)
+    return m ? parseInt(m[1], 10) : null
+  }
+
+  return await new Promise(function (resolve, reject) {
+    exec
+      .exec(
+        namespace(),
+        podName,
+        containerName,
+        command,
+        capture,
+        captureErr,
+        stdin ?? null,
+        false /* tty */,
+        resp => {
+          core.debug(`execPodStepWithOutput response: ${JSON.stringify(resp)}`)
+          flushPending()
+          if (resp.status === 'Success') {
+            resolve({ code: resp.code || 0, output: buffer.join('\n') })
+          } else {
+            // k8s exec returns status='Failure' for non-zero script exit.
+            // resp.code may be undefined depending on k8s version; fall back
+            // to parsing the exit code from the message string.
+            const code = parseExitCode(resp?.message)
+            if (code !== null) {
+              resolve({ code, output: buffer.join('\n') })
+            } else {
+              reject(new Error(resp?.message || 'execPodStepWithOutput failed'))
+            }
+          }
+        }
+      )
+      .catch(e => {
+        // In @kubernetes/client-node v1.x the promise returned by exec()
+        // itself rejects for non-zero exits (the status callback may or may
+        // not fire first). Detect this case via the error message so the
+        // caller can classify the error instead of treating it as a hook
+        // failure. Genuine failures (connection drop, etc.) still reject.
+        flushPending()
+        const errMsg = e instanceof Error ? e.message : String(e)
+        const code = parseExitCode(errMsg)
+        if (code !== null) {
+          resolve({ code, output: buffer.join('\n') })
+        } else {
+          reject(e)
+        }
+      })
+  })
+}
+
 export async function execCalculateOutputHashSorted(
   podName: string,
   containerName: string,
@@ -1004,6 +1127,29 @@ async function describePodWarningEvents(podName: string): Promise<string[]> {
   return lines
 }
 
+// Aggregates the three independent error-detection sources (container waiting
+// reasons, pod Warning events, and pod conditions) into a single list, applying
+// the cross-source deduplication rule (FailedScheduling event + Unschedulable
+// condition = same failure, report once). Returns [] when no unrecoverable
+// error is detected. The caller decides what to do with the list -- typically
+// attach describePodFailure diagnostics and throw.
+export async function checkUnrecoverableErrors(
+  pod: k8s.V1Pod,
+  podName: string
+): Promise<string[]> {
+  // Deterministic terminal errors on a container (e.g. ImagePullBackOff).
+  const containerErrors = getContainerErrors(pod)
+  // Best-effort: returns [] when the optional events RBAC permission is absent.
+  const eventErrors = await getPodEventErrors(podName)
+  // Conditions are set near-instantly by the scheduler while events may take
+  // a few extra seconds to propagate, so always run the check. Deduplicate
+  // against events so the same FailedScheduling isn't printed twice.
+  const conditionErrors = getPodConditionErrors(pod).filter(
+    c => !eventErrors.some(e => e.includes('FailedScheduling') && c.includes('Unschedulable'))
+  )
+  return [...containerErrors, ...eventErrors, ...conditionErrors]
+}
+
 export async function waitForPodPhases(
   podName: string,
   awaitingPhases: Set<PodPhase>,
@@ -1028,28 +1174,14 @@ export async function waitForPodPhases(
       )
     }
 
-    // Still in a back-off phase, but a container hit a deterministic terminal
-    // error (e.g. ImagePullBackOff) -- fail fast with diagnostics instead of
-    // waiting out the full timeout.
-    const containerErrors = getContainerErrors(pod)
-    // Check pod Warning events (FailedMount, FailedScheduling, FailedBinding).
-    // Best-effort: returns [] when the optional events RBAC permission is absent.
-    const eventErrors = await getPodEventErrors(podName)
-    // ALWAYS run condition check (not just as fallback when events are empty):
-    // conditions are set near-instantly by the scheduler while events may take
-    // a few extra seconds to propagate. Running both ensures we catch scheduling
-    // failures even if events appear slightly later. Deduplicate the output so
-    // the same failure isn't printed twice (event and condition both fire for
-    // FailedScheduling when RBAC works).
-    const rawConditionErrors = getPodConditionErrors(pod)
-    const conditionErrors = rawConditionErrors.filter(
-      c => !eventErrors.some(e => e.includes('FailedScheduling') && c.includes('Unschedulable'))
-    )
-    if (containerErrors.length > 0 || eventErrors.length > 0 || conditionErrors.length > 0) {
-      const allErrors = [...containerErrors, ...eventErrors, ...conditionErrors]
+    // Still in a back-off phase, but a deterministic unrecoverable error
+    // was detected (container / event / condition). Fail fast with
+    // diagnostics instead of waiting out the full timeout.
+    const errors = await checkUnrecoverableErrors(pod, podName)
+    if (errors.length > 0) {
       const details = await describePodFailure(podName)
       throw new Error(
-        `Pod ${podName} has unrecoverable errors:\n${allErrors.join('\n')}\n${'─'.repeat(60)}\n${details}`
+        `Pod ${podName} has unrecoverable errors:\n${errors.join('\n')}\n${'─'.repeat(60)}\n${details}`
       )
     }
 
