@@ -817,18 +817,15 @@ export const UNRECOVERABLE_WAITING_REASONS = new Set([
 //     Secret/ConfigMap volume). The container stays in `ContainerCreating`
 //     waiting state, which is NOT in UNRECOVERABLE_WAITING_REASONS, so without
 //     this check the hook polls until the 3600s timeout.
-//   - FailedScheduling: the scheduler cannot place the pod. Only treated as
-//     unrecoverable when the message indicates a *permanent* configuration
-//     mismatch (e.g. node selector / taint / topology mismatch). When the
-//     message indicates a *transient* resource shortage ("Insufficient cpu",
-//     "didn't match Pod's node affinity/selector" due to label absence, etc.)
-//     we let the pod keep queuing until the timeout -- a node may free up or
-//     a new node may join. See isTransientSchedulingFailure() for the heuristic.
 //   - FailedBinding: a PVC could not be bound (no matching PV, storage class
 //     misconfiguration). Usually paired with FailedMount once the pod retries.
+//
+// Note: FailedScheduling is intentionally excluded. Scheduling failures are
+// almost always transient resource shortages (Insufficient cpu/memory/gpu) that
+// self-resolve once a node frees up or scales in. Fast-failing on them would
+// terminate jobs that should simply queue until the timeout.
 export const UNRECOVERABLE_EVENT_REASONS = new Set([
   'FailedMount',
-  'FailedScheduling',
   'FailedBinding'
 ])
 
@@ -837,41 +834,6 @@ export const UNRECOVERABLE_TERMINATED_REASONS = new Set([
   'Error',
   'FailedPostStartHookError'
 ])
-
-// Patterns that POSITIVELY IDENTIFY a permanent, unrecoverable scheduling
-// configuration error in a FailedScheduling event or Unschedulable condition
-// message. Fast-fail is triggered ONLY when one of these matches.
-//
-// Conservative by design: when a message is absent, empty, or does not match
-// any pattern we treat it as transient and let the pod keep queuing until the
-// timeout fires. This avoids false-positive fast-fails on:
-//   - Resource shortages ("Insufficient cpu/memory/gpu") that self-resolve
-//   - New or unknown kube-scheduler message formats
-//   - Scheduler messages that change across Kubernetes versions
-//
-// Examples of permanent messages (WILL fast-fail):
-//   "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."
-//   "0/3 nodes are available: 3 node(s) had untolerated taint {key: value}."
-//
-// Examples of messages that will NOT fast-fail (queue until timeout instead):
-//   "0/3 nodes are available: 3 Insufficient nvidia.com/gpu."   ← resource wait
-//   "0/3 nodes are available: 3 Insufficient memory."           ← resource wait
-//   "0/1 nodes are available"                                   ← unknown/ambiguous
-//   (no message)                                                ← unknown
-//
-// To fast-fail on additional patterns without a code change, set env var
-// ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS to a comma-separated list
-// of regular-expression strings (added to this set; cannot remove entries).
-export const PERMANENT_SCHEDULING_PATTERNS: readonly RegExp[] = [
-  // Node selector / affinity label mismatch — the pod's nodeSelector or
-  // nodeAffinity requires labels that no node in the cluster has. Will not
-  // self-resolve without a pod-spec or node-label change.
-  /node\(s\) didn't match Pod's node affinity\/selector/i,
-  /node\(s\) didn't match node affinity/i,
-  // Untolerated taint — every node carries a taint the pod does not tolerate.
-  // Will not self-resolve without adding a toleration or removing the taint.
-  /node\(s\) had untolerated taint/i,
-]
 
 // Maximum number of Warning events to include in a pod's failure description so
 // that the GitHub Actions log is not flooded.
@@ -929,6 +891,29 @@ export function getUnrecoverableTerminatedReasons(): Set<string> {
   return reasons
 }
 
+function getWaitingReasonHint(reason: string): string {
+  switch (reason) {
+    case 'ImagePullBackOff':
+    case 'ErrImagePull':
+      return [
+        `  → Check that the image name and tag are correct and exist in the registry.`,
+        `    If the image is in a private registry, ensure an imagePullSecret is configured.`,
+        `    Check network connectivity from the node to the registry (DNS, firewall, proxy).`,
+        `    Run: kubectl describe pod <pod> | grep -A5 "Events"`,
+      ].join('\n')
+    case 'InvalidImageName':
+      return `  → Image name is malformed. Check the workflow/job container image configuration.`
+    case 'CreateContainerConfigError':
+      return `  → Container config is invalid. Check env vars, resource limits, and securityContext in the job spec.`
+    case 'CreateContainerError':
+      return `  → Container runtime failed to create the container. Check node-level issues or contact the cluster administrator.`
+    case 'FailedMount':
+      return `  → A volume could not be mounted. Check that the PVC is bound, the Secret/ConfigMap exists, and hostPath directories are present on the node.`
+    default:
+      return `  → Check pod events with: kubectl describe pod <pod>`
+  }
+}
+
 export function getContainerErrors(pod: k8s.V1Pod): string[] {
   const errors: string[] = []
   const unrecoverableReasons = getUnrecoverableWaitingReasons()
@@ -939,13 +924,37 @@ export function getContainerErrors(pod: k8s.V1Pod): string[] {
   for (const cs of allStatuses) {
     const waiting = cs.state?.waiting
     if (waiting?.reason && unrecoverableReasons.has(waiting.reason)) {
-      // Format as two indented lines: reason on first, message detail on second
       const reason = `  ✗ container "${cs.name}": ${waiting.reason}`
-      const detail = waiting.message ? `    ${waiting.message}` : ''
-      errors.push(detail ? `${reason}\n${detail}` : reason)
+      const detail = waiting.message ? `\n    ${waiting.message}` : ''
+      const hint = `\n${getWaitingReasonHint(waiting.reason)}`
+      errors.push(`${reason}${detail}${hint}`)
     }
   }
   return errors
+}
+
+export function getTerminatedReasonHint(reason: string, exitCode: number | undefined): string {
+  if (reason === 'OOMKilled') {
+    return `  → Container exceeded its memory limit and was killed by the OOM killer.\n    Increase the memory limit in the job spec or reduce memory usage in the script.`
+  }
+  if (reason === 'FailedPostStartHookError') {
+    return `  → The postStart lifecycle hook failed. Check the hook command and its exit code.`
+  }
+  if (reason === 'Error') {
+    switch (exitCode) {
+      case 137:
+        return `  → Exit code 137: process was killed (SIGKILL). Likely OOM or forceful termination.\n    Check memory usage and resource limits.`
+      case 139:
+        return `  → Exit code 139: segmentation fault (SIGSEGV). The process crashed due to a memory access error.`
+      case 126:
+        return `  → Exit code 126: permission denied. The script or binary is not executable.\n    Check file permissions inside the container image.`
+      case 127:
+        return `  → Exit code 127: command not found. The script or binary does not exist in the container.\n    Check the image contents and the command/entrypoint configuration.`
+      default:
+        return `  → Script or process exited with a non-zero code (${exitCode ?? 'unknown'}).\n    Check the step output above for error messages.\n    Common causes: script logic errors, missing dependencies, unhandled exceptions.`
+    }
+  }
+  return `  → Check pod logs with: kubectl logs <pod> -c ${reason}`
 }
 
 export function getContainerTerminatedErrors(pod: k8s.V1Pod): string[] {
@@ -960,86 +969,32 @@ export function getContainerTerminatedErrors(pod: k8s.V1Pod): string[] {
     if (terminated?.reason && unrecoverableReasons.has(terminated.reason)) {
       const reason = `  ✗ container "${cs.name}": ${terminated.reason} (exit code ${terminated.exitCode})`
       const detail = terminated.message ? `\n    ${terminated.message}` : ''
-      errors.push(detail ? `${reason}${detail}` : reason)
+      const hint = `\n${getTerminatedReasonHint(terminated.reason, terminated.exitCode)}`
+      errors.push(`${reason}${detail}${hint}`)
     }
   }
   return errors
 }
 
-// Returns true when a FailedScheduling event message or Unschedulable condition
-// message positively identifies a permanent, unrecoverable configuration error.
-// Returns false (treat as transient, keep queuing) for:
-//   - absent/empty messages         → unknown, assume transient
-//   - resource shortages            → Insufficient cpu/memory/gpu/etc.
-//   - any unrecognised message      → unknown, assume transient
-//
-// Used by getPodConditionErrors and getPodEventErrors.  Extend the match set
-// at runtime via ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS (CSV regexes).
-export function isPermanentSchedulingFailure(message: string | undefined): boolean {
-  if (!message) {
-    // No message → cannot confirm permanent → treat as transient (safe default).
-    return false
+function getEventReasonHint(reason: string): string {
+  switch (reason) {
+    case 'FailedMount':
+      return [
+        `  → A volume could not be mounted. Check:`,
+        `    - PVC is bound (kubectl get pvc)`,
+        `    - Secret/ConfigMap referenced in the volume exists`,
+        `    - hostPath directories exist on the scheduled node`,
+      ].join('\n')
+    case 'FailedBinding':
+      return [
+        `  → A PVC could not be bound to a PV. Check:`,
+        `    - StorageClass exists and has a provisioner`,
+        `    - Sufficient capacity is available`,
+        `    - Access mode (ReadWriteOnce/ReadWriteMany) matches available PVs`,
+      ].join('\n')
+    default:
+      return `  → Check pod events with: kubectl describe pod <pod>`
   }
-  const patterns = getPermanentSchedulingPatterns()
-  return patterns.some(p => p.test(message))
-}
-
-// Returns the PERMANENT_SCHEDULING_PATTERNS set extended by any extra patterns
-// supplied via the ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS env var
-// (comma-separated list of regular expression strings, e.g. "my pattern,other").
-// Invalid regex strings are skipped with a warning.
-export function getPermanentSchedulingPatterns(): readonly RegExp[] {
-  const extra = process.env['ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS']
-  if (!extra) {
-    return PERMANENT_SCHEDULING_PATTERNS
-  }
-  const patterns: RegExp[] = [...PERMANENT_SCHEDULING_PATTERNS]
-  for (const raw of extra.split(',')) {
-    const trimmed = raw.trim()
-    if (!trimmed) continue
-    try {
-      patterns.push(new RegExp(trimmed, 'i'))
-    } catch {
-      core.warning(
-        `ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS: invalid regex "${trimmed}", skipped`
-      )
-    }
-  }
-  return patterns
-}
-
-// Inspects the pod's status.conditions for deterministic scheduling failures.
-// This is the RBAC-free companion to getPodEventErrors: pod conditions are
-// always readable without the optional 'events' list permission.
-//
-//   PodScheduled=False/Unschedulable: the scheduler could not place the pod.
-//   Fast-fail is triggered ONLY when the condition message positively matches
-//   a known-permanent error (see isPermanentSchedulingFailure). Resource
-//   shortages, absent messages, and any unrecognised message are treated as
-//   transient -- the pod keeps queuing until the timeout.
-//
-// Never throws; on any unexpected error it returns [].
-export function getPodConditionErrors(pod: k8s.V1Pod): string[] {
-  const errors: string[] = []
-  for (const cond of pod.status?.conditions ?? []) {
-    if (
-      cond.type === 'PodScheduled' &&
-      cond.status === 'False' &&
-      cond.reason === 'Unschedulable'
-    ) {
-      // Only fast-fail on confirmed permanent config errors; everything else
-      // (Insufficient resources, unknown message, no message) keeps queuing.
-      if (!isPermanentSchedulingFailure(cond.message)) {
-        core.debug(
-          `[fast-fail] Skipping Unschedulable condition (not a recognised permanent failure): ${cond.message ?? '(no message)'}`
-        )
-        continue
-      }
-      const msg = cond.message ? `\n    ${cond.message}` : ''
-      errors.push(`  ✗ condition: ${cond.type}=False (${cond.reason})${msg}`)
-    }
-  }
-  return errors
 }
 
 // Inspects the pod's Warning events for reasons in UNRECOVERABLE_EVENT_REASONS
@@ -1077,26 +1032,15 @@ export async function getPodEventErrors(podName: string): Promise<string[]> {
     if (e.type !== 'Warning' || !e.reason || !unrecoverableReasons.has(e.reason)) {
       continue
     }
-    // For FailedScheduling: only fast-fail when the message positively matches
-    // a known-permanent config error (node affinity/selector mismatch, untolerated
-    // taint). Resource shortages ("Insufficient *"), absent messages, and any
-    // unrecognised format are treated as transient -- let the pod keep queuing.
-    if (e.reason === 'FailedScheduling' && !isPermanentSchedulingFailure(e.message)) {
-      core.debug(
-        `[fast-fail] Skipping FailedScheduling (not recognised as permanent): ${
-          e.message ?? '(no message)'
-        }`
-      )
-      continue
-    }
     if (seenReasons.has(e.reason)) {
       continue
     }
     seenReasons.add(e.reason)
     const count = e.count && e.count > 1 ? ` (x${e.count})` : ''
     const reason = `  ✗ event: ${e.reason}${count}`
-    const detail = e.message ? `    ${e.message}` : ''
-    errors.push(detail ? `${reason}\n${detail}` : reason)
+    const detail = e.message ? `\n    ${e.message}` : ''
+    const hint = getEventReasonHint(e.reason)
+    errors.push(`${reason}${detail}\n${hint}`)
   }
   return errors
 }
@@ -1225,6 +1169,16 @@ async function describePodWarningEvents(podName: string): Promise<string[]> {
     )
   }
   return lines
+}
+
+// Inspects the pod's status.conditions for scheduling failures. FailedScheduling
+// is intentionally excluded from fast-fail detection (see UNRECOVERABLE_EVENT_REASONS
+// comment) — scheduling failures are transient resource waits that should queue
+// until the timeout, not terminate early. This function always returns [] as a
+// result, but is kept so checkUnrecoverableErrors compiles and the dedup logic
+// remains intact for future use.
+export function getPodConditionErrors(_pod: k8s.V1Pod): string[] {
+  return []
 }
 
 // Aggregates the three independent error-detection sources (container waiting

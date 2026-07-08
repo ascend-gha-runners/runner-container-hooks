@@ -13,6 +13,7 @@ import {
   getContainerTerminatedErrors,
   getPodByName,
   getPrepareJobTimeoutSeconds,
+  getTerminatedReasonHint,
   waitForPodPhases
 } from '../k8s'
 import {
@@ -191,12 +192,13 @@ async function classifyScriptError(
         (term.exitCode === 137 && reason !== 'Completed')
       if (isContainerFault) {
         const detail = term.message ? `\n    ${term.message}` : ''
+        const hint = `\n${getTerminatedReasonHint(reason, term.exitCode)}`
         errors.push(
-          `  ✗ container "${JOB_CONTAINER_NAME}": ${reason} (exit code ${term.exitCode}) — container-level failure, not a script error${detail}`
+          `  ✗ container "${JOB_CONTAINER_NAME}": ${reason} (exit code ${term.exitCode})${detail}${hint}`
         )
       } else {
         errors.push(
-          `  → container exited cleanly; please check your script for errors`
+          `  → your script exited with a non-zero code; please check your script for errors`
         )
         sections.push(
           `Container status: ${reason} (exit code ${term.exitCode})`
