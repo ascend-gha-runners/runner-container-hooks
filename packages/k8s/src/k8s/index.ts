@@ -866,7 +866,7 @@ export const PERMANENT_SCHEDULING_PATTERNS: readonly RegExp[] = [
   // PVC referenced in the pod spec does not exist in the namespace. The
   // scheduler refuses to place the pod until the PVC is created. The workflow
   // job spec is wrong — it won't self-resolve.
-  /persistentvolumeclaim ".+" not found/i,
+  /persistentvolumeclaim "[^"]+" not found/i,
 ]
 
 export const UNRECOVERABLE_TERMINATED_REASONS = new Set([
@@ -945,9 +945,18 @@ export function isPermanentSchedulingFailure(message: string | undefined): boole
 // Returns PERMANENT_SCHEDULING_PATTERNS extended by any extra patterns from
 // ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS (comma-separated regexes).
 // Invalid regex strings are skipped with a warning.
+// The compiled result is cached: env var changes during a single process are
+// rare (effectively never in a runner job), but this avoids repeated split +
+// RegExp construction on every FailedScheduling poll iteration.
+let _cachedSchedulingPatterns: readonly RegExp[] | undefined
+let _lastSchedulingPatternsEnv: string | undefined
+
 export function getPermanentSchedulingPatterns(): readonly RegExp[] {
   const extra = process.env['ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS']
   if (!extra) return PERMANENT_SCHEDULING_PATTERNS
+  if (_cachedSchedulingPatterns && _lastSchedulingPatternsEnv === extra) {
+    return _cachedSchedulingPatterns
+  }
   const patterns: RegExp[] = [...PERMANENT_SCHEDULING_PATTERNS]
   for (const raw of extra.split(',')) {
     const trimmed = raw.trim()
@@ -960,6 +969,8 @@ export function getPermanentSchedulingPatterns(): readonly RegExp[] {
       )
     }
   }
+  _lastSchedulingPatternsEnv = extra
+  _cachedSchedulingPatterns = patterns
   return patterns
 }
 
