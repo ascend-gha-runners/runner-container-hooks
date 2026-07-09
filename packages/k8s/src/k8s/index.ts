@@ -798,12 +798,20 @@ export async function pruneSecrets(): Promise<void> {
 }
 
 export const UNRECOVERABLE_WAITING_REASONS = new Set([
+  // k8s has already retried image pull multiple times with exponential backoff.
+  // ErrImagePull is excluded: it fires on the first failure (could be a transient
+  // TLS timeout or network blip) and k8s will naturally promote it to
+  // ImagePullBackOff after a moment. Fast-failing on ErrImagePull would kill
+  // jobs that would have succeeded on the next pull attempt.
   'ImagePullBackOff',
-  'ErrImagePull',
+  // Image name is syntactically invalid — cannot self-heal without a config fix.
   'InvalidImageName',
+  // Container spec is invalid (bad env vars, resource limits, securityContext) —
+  // cannot self-heal without a config fix.
   'CreateContainerConfigError',
-  'CreateContainerError',
-  'FailedMount'
+  // CreateContainerError is excluded: it is sometimes emitted transiently by the
+  // container runtime (e.g. during a node-level runtime restart). It can
+  // self-resolve on the next kubelet retry cycle.
 ])
 
 // Pod *event* reasons (from the event stream, not container status) that
@@ -820,14 +828,46 @@ export const UNRECOVERABLE_WAITING_REASONS = new Set([
 //   - FailedBinding: a PVC could not be bound (no matching PV, storage class
 //     misconfiguration). Usually paired with FailedMount once the pod retries.
 //
-// Note: FailedScheduling is intentionally excluded. Scheduling failures are
-// almost always transient resource shortages (Insufficient cpu/memory/gpu) that
-// self-resolve once a node frees up or scales in. Fast-failing on them would
-// terminate jobs that should simply queue until the timeout.
+// FailedScheduling is included but gated by PERMANENT_SCHEDULING_PATTERNS:
+// only messages that positively identify a permanent configuration error
+// trigger fast-fail. Resource shortages ("Insufficient cpu/memory/gpu")
+// are silently skipped so the pod keeps queuing until the timeout.
 export const UNRECOVERABLE_EVENT_REASONS = new Set([
   'FailedMount',
-  'FailedBinding'
+  'FailedBinding',
+  'FailedScheduling'
 ])
+
+// Patterns that POSITIVELY IDENTIFY a permanent, unrecoverable scheduling
+// failure in a FailedScheduling event message. Fast-fail fires ONLY when
+// one of these matches. Anything else (resource shortages, unknown format,
+// absent message) is treated as transient — the pod keeps queuing.
+//
+// Permanent examples (WILL fast-fail):
+//   "0/3 nodes: 3 node(s) didn't match Pod's node affinity/selector."
+//   "0/3 nodes: 3 node(s) had untolerated taint {gpu: true}."
+//   "0/3 nodes: persistentvolumeclaim "my-pvc" not found."
+//
+// Transient examples (will NOT fast-fail, keep queuing):
+//   "0/3 nodes: 3 Insufficient nvidia.com/gpu."
+//   "0/3 nodes: 3 Insufficient memory."
+//   "0/1 nodes are available"  ← ambiguous, unknown
+//
+// Extend at runtime via env var ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS
+// (comma-separated regex strings; cannot remove built-in entries).
+export const PERMANENT_SCHEDULING_PATTERNS: readonly RegExp[] = [
+  // Node selector / affinity label mismatch — no node carries the required
+  // labels. Will not self-resolve without a pod-spec or node-label change.
+  /node\(s\) didn't match Pod's node affinity\/selector/i,
+  /node\(s\) didn't match node affinity/i,
+  // Untolerated taint — every node carries a taint the pod does not tolerate.
+  // Will not self-resolve without adding a toleration or removing the taint.
+  /node\(s\) had untolerated taint/i,
+  // PVC referenced in the pod spec does not exist in the namespace. The
+  // scheduler refuses to place the pod until the PVC is created. The workflow
+  // job spec is wrong — it won't self-resolve.
+  /persistentvolumeclaim ".+" not found/i,
+]
 
 export const UNRECOVERABLE_TERMINATED_REASONS = new Set([
   'OOMKilled',
@@ -891,24 +931,52 @@ export function getUnrecoverableTerminatedReasons(): Set<string> {
   return reasons
 }
 
+// Returns true when a FailedScheduling event message positively identifies a
+// permanent configuration error that will not self-resolve. Returns false
+// (treat as transient, keep queuing) for:
+//   - absent/empty messages   → unknown, assume transient
+//   - resource shortages      → Insufficient cpu/memory/gpu/etc.
+//   - any unrecognised format → unknown, assume transient
+export function isPermanentSchedulingFailure(message: string | undefined): boolean {
+  if (!message) return false
+  return getPermanentSchedulingPatterns().some(p => p.test(message))
+}
+
+// Returns PERMANENT_SCHEDULING_PATTERNS extended by any extra patterns from
+// ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS (comma-separated regexes).
+// Invalid regex strings are skipped with a warning.
+export function getPermanentSchedulingPatterns(): readonly RegExp[] {
+  const extra = process.env['ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS']
+  if (!extra) return PERMANENT_SCHEDULING_PATTERNS
+  const patterns: RegExp[] = [...PERMANENT_SCHEDULING_PATTERNS]
+  for (const raw of extra.split(',')) {
+    const trimmed = raw.trim()
+    if (!trimmed) continue
+    try {
+      patterns.push(new RegExp(trimmed, 'i'))
+    } catch {
+      core.warning(
+        `ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS: invalid regex "${trimmed}", skipped`
+      )
+    }
+  }
+  return patterns
+}
+
 function getWaitingReasonHint(reason: string): string {
   switch (reason) {
     case 'ImagePullBackOff':
-    case 'ErrImagePull':
       return [
-        `  → Check that the image name and tag are correct and exist in the registry.`,
-        `    If the image is in a private registry, ensure an imagePullSecret is configured.`,
-        `    Check network connectivity from the node to the registry (DNS, firewall, proxy).`,
-        `    Run: kubectl describe pod <pod> | grep -A5 "Events"`,
+        `  → Image pull has failed repeatedly (k8s retried with exponential backoff). Check:`,
+        `    - Image name and tag are correct and exist in the registry`,
+        `    - If private registry: imagePullSecret is configured and credentials are valid`,
+        `    - Network connectivity from the node to the registry (DNS, firewall, proxy, TLS)`,
+        `    Run: kubectl describe pod <pod> | grep -A10 "Events"`,
       ].join('\n')
     case 'InvalidImageName':
       return `  → Image name is malformed. Check the workflow/job container image configuration.`
     case 'CreateContainerConfigError':
       return `  → Container config is invalid. Check env vars, resource limits, and securityContext in the job spec.`
-    case 'CreateContainerError':
-      return `  → Container runtime failed to create the container. Check node-level issues or contact the cluster administrator.`
-    case 'FailedMount':
-      return `  → A volume could not be mounted. Check that the PVC is bound, the Secret/ConfigMap exists, and hostPath directories are present on the node.`
     default:
       return `  → Check pod events with: kubectl describe pod <pod>`
   }
@@ -992,18 +1060,26 @@ function getEventReasonHint(reason: string): string {
         `    - Sufficient capacity is available`,
         `    - Access mode (ReadWriteOnce/ReadWriteMany) matches available PVs`,
       ].join('\n')
+    case 'FailedScheduling':
+      return [
+        `  → Pod cannot be scheduled due to a permanent configuration error. Check:`,
+        `    - nodeSelector / nodeAffinity labels match at least one node`,
+        `    - All tolerations are present for node taints`,
+        `    - PVCs referenced in the pod spec exist in the namespace`,
+      ].join('\n')
     default:
       return `  → Check pod events with: kubectl describe pod <pod>`
   }
 }
 
-// Inspects the pod's Warning events for reasons in UNRECOVERABLE_EVENT_REASONS
-// (e.g. FailedMount when a hostPath directory does not exist). Unlike container
-// waiting reasons, these appear only in the event stream, so a separate API
-// call is required. Best-effort: if events cannot be listed (e.g. the optional
-// 'events' RBAC permission is missing) it returns an empty list instead of
-// blocking fast-fail detection of container-level errors. Deduplicates by
-// reason so a repeatedly retried FailedMount is reported once.
+// Inspects the pod's Warning events for reasons in UNRECOVERABLE_EVENT_REASONS.
+// For FailedScheduling, only fast-fails when the message positively matches
+// a known-permanent configuration error (see PERMANENT_SCHEDULING_PATTERNS).
+// Resource shortages ("Insufficient cpu/memory/gpu") are silently skipped so
+// the pod keeps queuing until the timeout. Best-effort: if events cannot be
+// listed (e.g. the optional 'events' RBAC permission is missing) it returns []
+// instead of blocking container-level fast-fail detection. Deduplicates by
+// reason so a repeatedly-retried event is reported once.
 export async function getPodEventErrors(podName: string): Promise<string[]> {
   const unrecoverableReasons = getUnrecoverableEventReasons()
   if (unrecoverableReasons.size === 0) {
@@ -1030,6 +1106,17 @@ export async function getPodEventErrors(podName: string): Promise<string[]> {
   const seenReasons = new Set<string>()
   for (const e of items) {
     if (e.type !== 'Warning' || !e.reason || !unrecoverableReasons.has(e.reason)) {
+      continue
+    }
+    // FailedScheduling: only fast-fail when the message positively matches a
+    // known-permanent config error. Resource shortages and unknown messages
+    // are treated as transient — let the pod keep queuing.
+    if (e.reason === 'FailedScheduling' && !isPermanentSchedulingFailure(e.message)) {
+      core.debug(
+        `[fast-fail] Skipping FailedScheduling (not a recognised permanent error): ${
+          e.message ?? '(no message)'
+        }`
+      )
       continue
     }
     if (seenReasons.has(e.reason)) {
