@@ -111,18 +111,19 @@ describe('getContainerErrors', () => {
     expect(getContainerErrors(pod)).toEqual([])
   })
 
-  it('detects every unrecoverable waiting reason', () => {
+  it('detects every unrecoverable waiting reason and includes a hint', () => {
     for (const reason of Array.from(UNRECOVERABLE_WAITING_REASONS)) {
       const pod = buildPod(PodPhase.PENDING, {
         containerStatuses: [waitingContainer('job', reason)]
       })
-      expect(getContainerErrors(pod)).toEqual([
-        `  ✗ container "job": ${reason}`
-      ])
+      const errors = getContainerErrors(pod)
+      expect(errors).toHaveLength(1)
+      expect(errors[0]).toContain(`  ✗ container "job": ${reason}`)
+      expect(errors[0]).toContain('→')
     }
   })
 
-  it('includes the waiting message as an indented second line', () => {
+  it('includes the waiting message and a network/registry hint for ErrImagePull', () => {
     const pod = buildPod(PodPhase.PENDING, {
       containerStatuses: [
         waitingContainer(
@@ -132,9 +133,12 @@ describe('getContainerErrors', () => {
         )
       ]
     })
-    expect(getContainerErrors(pod)).toEqual([
-      '  ✗ container "job": ErrImagePull\n    Back-off pulling image "does-not-exist:latest"'
-    ])
+    const errors = getContainerErrors(pod)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ container "job": ErrImagePull')
+    expect(errors[0]).toContain('Back-off pulling image "does-not-exist:latest"')
+    expect(errors[0]).toContain('registry')
+    expect(errors[0]).toContain('network')
   })
 
   it('inspects init containers as well as regular containers', () => {
@@ -142,10 +146,10 @@ describe('getContainerErrors', () => {
       initContainerStatuses: [waitingContainer('init', 'ImagePullBackOff')],
       containerStatuses: [waitingContainer('job', 'CreateContainerError')]
     })
-    expect(getContainerErrors(pod)).toEqual([
-      '  ✗ container "init": ImagePullBackOff',
-      '  ✗ container "job": CreateContainerError'
-    ])
+    const errors = getContainerErrors(pod)
+    expect(errors).toHaveLength(2)
+    expect(errors[0]).toContain('  ✗ container "init": ImagePullBackOff')
+    expect(errors[1]).toContain('  ✗ container "job": CreateContainerError')
   })
 
   it('ignores running/terminated containers and only collects waiting errors', () => {
@@ -155,9 +159,9 @@ describe('getContainerErrors', () => {
         waitingContainer('bad', 'InvalidImageName')
       ]
     })
-    expect(getContainerErrors(pod)).toEqual([
-      '  ✗ container "bad": InvalidImageName'
-    ])
+    const errors = getContainerErrors(pod)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ container "bad": InvalidImageName')
   })
 })
 
@@ -190,7 +194,7 @@ describe('getPodEventErrors', () => {
     expect(await getPodEventErrors('my-pod')).toEqual([])
   })
 
-  it('detects FailedMount (the hostPath Directory missing case)', async () => {
+  it('detects FailedMount (the hostPath Directory missing case) and includes hint', async () => {
     eventSpy.mockResolvedValue(
       eventResult([
         buildEvent(
@@ -200,24 +204,37 @@ describe('getPodEventErrors', () => {
         )
       ])
     )
-    expect(await getPodEventErrors('my-pod')).toEqual([
-      '  ✗ event: FailedMount (x3)\n    Unable to attach or mount volume "bad-hostpath": mount path "/this/path/does/not/exist" does not exist'
-    ])
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ event: FailedMount (x3)')
+    expect(errors[0]).toContain('does not exist')
+    expect(errors[0]).toContain('PVC')
   })
 
-  it('detects every unrecoverable event reason', async () => {
+  it('ignores FailedScheduling events (scheduling is always treated as queuing)', async () => {
+    // FailedScheduling is not in UNRECOVERABLE_EVENT_REASONS — never fast-fails.
     eventSpy.mockResolvedValue(
       eventResult([
-        buildEvent('FailedScheduling', '0/1 nodes are available'),
+        buildEvent('FailedScheduling', '0/3 nodes are available: 3 Insufficient nvidia.com/gpu.'),
+        buildEvent('FailedScheduling', "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.")
+      ])
+    )
+    expect(await getPodEventErrors('my-pod')).toEqual([])
+  })
+
+  it('detects FailedBinding and FailedMount (always unrecoverable) and includes hints', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
         buildEvent('FailedBinding', 'no persistent volumes available'),
         buildEvent('FailedMount', 'volume not found')
       ])
     )
-    expect(await getPodEventErrors('my-pod')).toEqual([
-      '  ✗ event: FailedScheduling\n    0/1 nodes are available',
-      '  ✗ event: FailedBinding\n    no persistent volumes available',
-      '  ✗ event: FailedMount\n    volume not found'
-    ])
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors).toHaveLength(2)
+    expect(errors[0]).toContain('  ✗ event: FailedBinding')
+    expect(errors[0]).toContain('StorageClass')
+    expect(errors[1]).toContain('  ✗ event: FailedMount')
+    expect(errors[1]).toContain('PVC')
   })
 
   it('ignores Normal-type events even if the reason matches', async () => {
@@ -235,20 +252,23 @@ describe('getPodEventErrors', () => {
       ])
     )
     // Only the first occurrence is kept.
-    expect(await getPodEventErrors('my-pod')).toEqual([
-      '  ✗ event: FailedMount\n    first attempt'
-    ])
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ event: FailedMount')
+    expect(errors[0]).toContain('first attempt')
   })
 
-  it('honors extra reasons from the env var', async () => {
+  it('honors extra reasons from the env var and includes default hint', async () => {
     process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_EVENT_REASONS'] =
       'FailedPreStopHook'
     eventSpy.mockResolvedValue(
       eventResult([buildEvent('FailedPreStopHook', 'hook failed')])
     )
-    expect(await getPodEventErrors('my-pod')).toEqual([
-      '  ✗ event: FailedPreStopHook\n    hook failed'
-    ])
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ event: FailedPreStopHook')
+    expect(errors[0]).toContain('hook failed')
+    expect(errors[0]).toContain('kubectl describe pod')
   })
 
   it('degrades gracefully when listing events is forbidden', async () => {
@@ -285,9 +305,9 @@ describe('getUnrecoverableWaitingReasons', () => {
     const pod = buildPod(PodPhase.PENDING, {
       containerStatuses: [waitingContainer('job', 'CrashLoopBackOff')]
     })
-    expect(getContainerErrors(pod)).toEqual([
-      '  ✗ container "job": CrashLoopBackOff'
-    ])
+    const errors = getContainerErrors(pod)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ container "job": CrashLoopBackOff')
   })
 })
 
@@ -337,37 +357,57 @@ describe('getContainerTerminatedErrors', () => {
     expect(getContainerTerminatedErrors(pod)).toEqual([])
   })
 
-  it('detects OOMKilled', () => {
+  it('detects OOMKilled and includes hint', () => {
     const pod = buildPod(PodPhase.FAILED, {
       containerStatuses: [
         terminatedContainer('job', 'OOMKilled', 137, 'The node was low on resource: memory')
       ]
     })
-    expect(getContainerTerminatedErrors(pod)).toEqual([
-      '  ✗ container "job": OOMKilled (exit code 137)\n    The node was low on resource: memory'
-    ])
+    const errors = getContainerTerminatedErrors(pod)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ container "job": OOMKilled (exit code 137)')
+    expect(errors[0]).toContain('The node was low on resource: memory')
+    expect(errors[0]).toContain('memory limit')
   })
 
-  it('detects Error (exit non-zero)', () => {
+  it('detects Error exit code 1 and includes generic hint', () => {
     const pod = buildPod(PodPhase.FAILED, {
-      containerStatuses: [
-        terminatedContainer('job', 'Error', 1)
-      ]
+      containerStatuses: [terminatedContainer('job', 'Error', 1)]
     })
-    expect(getContainerTerminatedErrors(pod)).toEqual([
-      '  ✗ container "job": Error (exit code 1)'
-    ])
+    const errors = getContainerTerminatedErrors(pod)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ container "job": Error (exit code 1)')
+    expect(errors[0]).toContain('non-zero code (1)')
   })
 
-  it('detects FailedPostStartHookError', () => {
+  it('detects Error exit code 137 and includes SIGKILL hint', () => {
+    const pod = buildPod(PodPhase.FAILED, {
+      containerStatuses: [terminatedContainer('job', 'Error', 137)]
+    })
+    const errors = getContainerTerminatedErrors(pod)
+    expect(errors[0]).toContain('exit code 137')
+    expect(errors[0]).toContain('SIGKILL')
+  })
+
+  it('detects Error exit code 127 and includes command-not-found hint', () => {
+    const pod = buildPod(PodPhase.FAILED, {
+      containerStatuses: [terminatedContainer('job', 'Error', 127)]
+    })
+    const errors = getContainerTerminatedErrors(pod)
+    expect(errors[0]).toContain('command not found')
+  })
+
+  it('detects FailedPostStartHookError and includes hint', () => {
     const pod = buildPod(PodPhase.FAILED, {
       containerStatuses: [
         terminatedContainer('job', 'FailedPostStartHookError', 137, 'postStart hook failed')
       ]
     })
-    expect(getContainerTerminatedErrors(pod)).toEqual([
-      '  ✗ container "job": FailedPostStartHookError (exit code 137)\n    postStart hook failed'
-    ])
+    const errors = getContainerTerminatedErrors(pod)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ container "job": FailedPostStartHookError (exit code 137)')
+    expect(errors[0]).toContain('postStart hook failed')
+    expect(errors[0]).toContain('postStart lifecycle hook')
   })
 
   it('detects every unrecoverable terminated reason', () => {
@@ -375,9 +415,9 @@ describe('getContainerTerminatedErrors', () => {
       const pod = buildPod(PodPhase.FAILED, {
         containerStatuses: [terminatedContainer('job', reason, 1)]
       })
-      expect(getContainerTerminatedErrors(pod)).toEqual([
-        `  ✗ container "job": ${reason} (exit code 1)`
-      ])
+      const errors = getContainerTerminatedErrors(pod)
+      expect(errors).toHaveLength(1)
+      expect(errors[0]).toContain(`  ✗ container "job": ${reason} (exit code 1)`)
     }
   })
 
@@ -386,10 +426,10 @@ describe('getContainerTerminatedErrors', () => {
       initContainerStatuses: [terminatedContainer('init', 'Error', 2)],
       containerStatuses: [terminatedContainer('job', 'OOMKilled', 137)]
     })
-    expect(getContainerTerminatedErrors(pod)).toEqual([
-      '  ✗ container "init": Error (exit code 2)',
-      '  ✗ container "job": OOMKilled (exit code 137)'
-    ])
+    const errors = getContainerTerminatedErrors(pod)
+    expect(errors).toHaveLength(2)
+    expect(errors[0]).toContain('  ✗ container "init": Error (exit code 2)')
+    expect(errors[1]).toContain('  ✗ container "job": OOMKilled (exit code 137)')
   })
 
   it('ignores terminated with reason not in the whitelist', () => {
@@ -428,9 +468,9 @@ describe('getUnrecoverableTerminatedReasons', () => {
     const pod = buildPod(PodPhase.FAILED, {
       containerStatuses: [terminatedContainer('job', 'DeadlineExceeded', 1)]
     })
-    expect(getContainerTerminatedErrors(pod)).toEqual([
-      '  ✗ container "job": DeadlineExceeded (exit code 1)'
-    ])
+    const errors = getContainerTerminatedErrors(pod)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ container "job": DeadlineExceeded (exit code 1)')
   })
 
   it('filters empty strings from the env var', () => {
@@ -531,11 +571,14 @@ describe('waitForPodPhases', () => {
     )
   })
 
-  it('fast-fails on FailedScheduling events', async () => {
-    readSpy.mockResolvedValue(podResult(buildPod(PodPhase.PENDING)))
-    eventSpy.mockResolvedValue(
-      eventResult([buildEvent('FailedScheduling', '0/1 nodes are available')])
-    )
+  it('retries on transient readPod failure and recovers when pod becomes ready', async () => {
+    // Risk A fix: a transient readPod error must NOT crash the loop immediately.
+    // Pod read fails twice, then returns Running — function must resolve.
+    readSpy
+      .mockRejectedValueOnce(new Error('connection refused') as never)
+      .mockRejectedValueOnce(new Error('connection refused') as never)
+      .mockResolvedValue(podResult(buildPod(PodPhase.RUNNING)))
+    // eventSpy already returns [] from beforeEach
 
     await expect(
       waitForPodPhases(
@@ -543,7 +586,7 @@ describe('waitForPodPhases', () => {
         new Set([PodPhase.RUNNING]),
         new Set([PodPhase.PENDING])
       )
-    ).rejects.toThrow(/event: FailedScheduling[\s\S]*0\/1 nodes are available/)
+    ).resolves.toBeUndefined()
   })
 
   it('throws with the phase when the pod is in a non-backoff phase', async () => {

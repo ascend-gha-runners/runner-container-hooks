@@ -817,14 +817,15 @@ export const UNRECOVERABLE_WAITING_REASONS = new Set([
 //     Secret/ConfigMap volume). The container stays in `ContainerCreating`
 //     waiting state, which is NOT in UNRECOVERABLE_WAITING_REASONS, so without
 //     this check the hook polls until the 3600s timeout.
-//   - FailedScheduling: the scheduler cannot place the pod (insufficient
-//     cpu/memory/gpu, node selector / affinity mismatch, no matching nodes).
-//     The pod stays Pending with PodScheduled=False forever.
 //   - FailedBinding: a PVC could not be bound (no matching PV, storage class
 //     misconfiguration). Usually paired with FailedMount once the pod retries.
+//
+// Note: FailedScheduling is intentionally excluded. Scheduling failures are
+// almost always transient resource shortages (Insufficient cpu/memory/gpu) that
+// self-resolve once a node frees up or scales in. Fast-failing on them would
+// terminate jobs that should simply queue until the timeout.
 export const UNRECOVERABLE_EVENT_REASONS = new Set([
   'FailedMount',
-  'FailedScheduling',
   'FailedBinding'
 ])
 
@@ -890,6 +891,29 @@ export function getUnrecoverableTerminatedReasons(): Set<string> {
   return reasons
 }
 
+function getWaitingReasonHint(reason: string): string {
+  switch (reason) {
+    case 'ImagePullBackOff':
+    case 'ErrImagePull':
+      return [
+        `  → Check that the image name and tag are correct and exist in the registry.`,
+        `    If the image is in a private registry, ensure an imagePullSecret is configured.`,
+        `    Check network connectivity from the node to the registry (DNS, firewall, proxy).`,
+        `    Run: kubectl describe pod <pod> | grep -A5 "Events"`,
+      ].join('\n')
+    case 'InvalidImageName':
+      return `  → Image name is malformed. Check the workflow/job container image configuration.`
+    case 'CreateContainerConfigError':
+      return `  → Container config is invalid. Check env vars, resource limits, and securityContext in the job spec.`
+    case 'CreateContainerError':
+      return `  → Container runtime failed to create the container. Check node-level issues or contact the cluster administrator.`
+    case 'FailedMount':
+      return `  → A volume could not be mounted. Check that the PVC is bound, the Secret/ConfigMap exists, and hostPath directories are present on the node.`
+    default:
+      return `  → Check pod events with: kubectl describe pod <pod>`
+  }
+}
+
 export function getContainerErrors(pod: k8s.V1Pod): string[] {
   const errors: string[] = []
   const unrecoverableReasons = getUnrecoverableWaitingReasons()
@@ -900,13 +924,37 @@ export function getContainerErrors(pod: k8s.V1Pod): string[] {
   for (const cs of allStatuses) {
     const waiting = cs.state?.waiting
     if (waiting?.reason && unrecoverableReasons.has(waiting.reason)) {
-      // Format as two indented lines: reason on first, message detail on second
       const reason = `  ✗ container "${cs.name}": ${waiting.reason}`
-      const detail = waiting.message ? `    ${waiting.message}` : ''
-      errors.push(detail ? `${reason}\n${detail}` : reason)
+      const detail = waiting.message ? `\n    ${waiting.message}` : ''
+      const hint = `\n${getWaitingReasonHint(waiting.reason)}`
+      errors.push(`${reason}${detail}${hint}`)
     }
   }
   return errors
+}
+
+export function getTerminatedReasonHint(reason: string, exitCode: number | undefined): string {
+  if (reason === 'OOMKilled') {
+    return `  → Container exceeded its memory limit and was killed by the OOM killer.\n    Increase the memory limit in the job spec or reduce memory usage in the script.`
+  }
+  if (reason === 'FailedPostStartHookError') {
+    return `  → The postStart lifecycle hook failed. Check the hook command and its exit code.`
+  }
+  if (reason === 'Error') {
+    switch (exitCode) {
+      case 137:
+        return `  → Exit code 137: process was killed (SIGKILL). Likely OOM or forceful termination.\n    Check memory usage and resource limits.`
+      case 139:
+        return `  → Exit code 139: segmentation fault (SIGSEGV). The process crashed due to a memory access error.`
+      case 126:
+        return `  → Exit code 126: permission denied. The script or binary is not executable.\n    Check file permissions inside the container image.`
+      case 127:
+        return `  → Exit code 127: command not found. The script or binary does not exist in the container.\n    Check the image contents and the command/entrypoint configuration.`
+      default:
+        return `  → Script or process exited with a non-zero code (${exitCode ?? 'unknown'}).\n    Check the step output above for error messages.\n    Common causes: script logic errors, missing dependencies, unhandled exceptions.`
+    }
+  }
+  return `  → Check pod logs with: kubectl logs <pod> -c ${reason}`
 }
 
 export function getContainerTerminatedErrors(pod: k8s.V1Pod): string[] {
@@ -921,37 +969,32 @@ export function getContainerTerminatedErrors(pod: k8s.V1Pod): string[] {
     if (terminated?.reason && unrecoverableReasons.has(terminated.reason)) {
       const reason = `  ✗ container "${cs.name}": ${terminated.reason} (exit code ${terminated.exitCode})`
       const detail = terminated.message ? `\n    ${terminated.message}` : ''
-      errors.push(detail ? `${reason}${detail}` : reason)
+      const hint = `\n${getTerminatedReasonHint(terminated.reason, terminated.exitCode)}`
+      errors.push(`${reason}${detail}${hint}`)
     }
   }
   return errors
 }
 
-// Inspects the pod's status.conditions for deterministic scheduling failures.
-// This is the RBAC-free companion to getPodEventErrors: pod conditions are
-// always readable without the optional 'events' list permission.
-//
-//   PodScheduled=False/Unschedulable: no node matched the pod's requirements
-//   (nodeSelector mismatch, insufficient resources). The scheduler sets this
-//   condition almost immediately and continues retrying. Self-healing IS
-//   possible (a node might free up), so this is a fallback used only when
-//   getPodEventErrors returns nothing (events RBAC unavailable). When events
-//   ARE available, the FailedScheduling event fires first and gates by count.
-//
-// Never throws; on any unexpected error it returns [].
-export function getPodConditionErrors(pod: k8s.V1Pod): string[] {
-  const errors: string[] = []
-  for (const cond of pod.status?.conditions ?? []) {
-    if (
-      cond.type === 'PodScheduled' &&
-      cond.status === 'False' &&
-      cond.reason === 'Unschedulable'
-    ) {
-      const msg = cond.message ? `\n    ${cond.message}` : ''
-      errors.push(`  ✗ condition: ${cond.type}=False (${cond.reason})${msg}`)
-    }
+function getEventReasonHint(reason: string): string {
+  switch (reason) {
+    case 'FailedMount':
+      return [
+        `  → A volume could not be mounted. Check:`,
+        `    - PVC is bound (kubectl get pvc)`,
+        `    - Secret/ConfigMap referenced in the volume exists`,
+        `    - hostPath directories exist on the scheduled node`,
+      ].join('\n')
+    case 'FailedBinding':
+      return [
+        `  → A PVC could not be bound to a PV. Check:`,
+        `    - StorageClass exists and has a provisioner`,
+        `    - Sufficient capacity is available`,
+        `    - Access mode (ReadWriteOnce/ReadWriteMany) matches available PVs`,
+      ].join('\n')
+    default:
+      return `  → Check pod events with: kubectl describe pod <pod>`
   }
-  return errors
 }
 
 // Inspects the pod's Warning events for reasons in UNRECOVERABLE_EVENT_REASONS
@@ -995,8 +1038,9 @@ export async function getPodEventErrors(podName: string): Promise<string[]> {
     seenReasons.add(e.reason)
     const count = e.count && e.count > 1 ? ` (x${e.count})` : ''
     const reason = `  ✗ event: ${e.reason}${count}`
-    const detail = e.message ? `    ${e.message}` : ''
-    errors.push(detail ? `${reason}\n${detail}` : reason)
+    const detail = e.message ? `\n    ${e.message}` : ''
+    const hint = getEventReasonHint(e.reason)
+    errors.push(`${reason}${detail}\n${hint}`)
   }
   return errors
 }
@@ -1127,6 +1171,16 @@ async function describePodWarningEvents(podName: string): Promise<string[]> {
   return lines
 }
 
+// Inspects the pod's status.conditions for scheduling failures. FailedScheduling
+// is intentionally excluded from fast-fail detection (see UNRECOVERABLE_EVENT_REASONS
+// comment) — scheduling failures are transient resource waits that should queue
+// until the timeout, not terminate early. This function always returns [] as a
+// result, but is kept so checkUnrecoverableErrors compiles and the dedup logic
+// remains intact for future use.
+export function getPodConditionErrors(_pod: k8s.V1Pod): string[] {
+  return []
+}
+
 // Aggregates the three independent error-detection sources (container waiting
 // reasons, pod Warning events, and pod conditions) into a single list, applying
 // the cross-source deduplication rule (FailedScheduling event + Unschedulable
@@ -1159,7 +1213,29 @@ export async function waitForPodPhases(
   const backOffManager = new BackOffManager(maxTimeSeconds)
   let phase: PodPhase = PodPhase.UNKNOWN
   while (true) {
-    const pod = await readPod(podName)
+    let pod: k8s.V1Pod
+    try {
+      pod = await readPod(podName)
+    } catch (err) {
+      // Transient API error (network blip, API server busy): log and back off
+      // rather than crashing the loop. The timeout will eventually fire if the
+      // pod stays permanently unreadable (e.g. RBAC issue).
+      core.warning(
+        `[waitForPodPhases] Could not read pod ${podName}, will retry after backoff: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      )
+      try {
+        await backOffManager.backOff()
+      } catch {
+        throw new Error(
+          `Pod ${podName} timed out after ${maxTimeSeconds}s (pod read failed: ${
+            err instanceof Error ? err.message : String(err)
+          })\n${'─'.repeat(60)}\n(pod was unreadable; no further diagnostics available)`
+        )
+      }
+      continue
+    }
     phase = parsePodPhase(pod)
     if (awaitingPhases.has(phase)) {
       return
