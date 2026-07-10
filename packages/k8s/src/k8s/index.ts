@@ -410,7 +410,7 @@ export async function execCalculateOutputHashSorted(
   podName: string,
   containerName: string,
   command: string[]
-): Promise<string> {
+): Promise<{ hash: string; lines: string[] }> {
   const exec = new k8s.Exec(kc)
 
   let output = ''
@@ -457,49 +457,49 @@ export async function execCalculateOutputHashSorted(
   outputWriter.end()
 
   // Sort lines for consistent ordering across platforms
-  const sortedOutput =
-    output
-      .split('\n')
-      .filter(line => line.length > 0)
-      .sort()
-      .join('\n') + '\n'
+  const lines = output
+    .split('\n')
+    .filter(line => line.length > 0)
+    .sort()
+  const sortedOutput = lines.join('\n') + '\n'
 
   const hash = createHash('sha256')
   hash.update(sortedOutput)
-  return hash.digest('hex')
+  return { hash: hash.digest('hex'), lines }
 }
 
 export async function localCalculateOutputHashSorted(
   commands: string[]
-): Promise<string> {
-  return await new Promise<string>((resolve, reject) => {
-    const child = spawn(commands[0], commands.slice(1), {
-      stdio: ['ignore', 'pipe', 'ignore']
-    })
+): Promise<{ hash: string; lines: string[] }> {
+  return await new Promise<{ hash: string; lines: string[] }>(
+    (resolve, reject) => {
+      const child = spawn(commands[0], commands.slice(1), {
+        stdio: ['ignore', 'pipe', 'ignore']
+      })
 
-    let output = ''
-    child.stdout.on('data', chunk => {
-      output += chunk.toString('utf8')
-    })
-    child.on('error', reject)
-    child.on('close', (code: number) => {
-      if (code === 0) {
-        // Sort lines for consistent ordering across distributions/platforms
-        const sortedOutput =
-          output
+      let output = ''
+      child.stdout.on('data', chunk => {
+        output += chunk.toString('utf8')
+      })
+      child.on('error', reject)
+      child.on('close', (code: number) => {
+        if (code === 0) {
+          // Sort lines for consistent ordering across distributions/platforms
+          const lines = output
             .split('\n')
             .filter(line => line.length > 0)
             .sort()
-            .join('\n') + '\n'
+          const sortedOutput = lines.join('\n') + '\n'
 
-        const hash = createHash('sha256')
-        hash.update(sortedOutput)
-        resolve(hash.digest('hex'))
-      } else {
-        reject(new Error(`child process exited with code ${code}`))
-      }
-    })
-  })
+          const hash = createHash('sha256')
+          hash.update(sortedOutput)
+          resolve({ hash: hash.digest('hex'), lines })
+        } else {
+          reject(new Error(`child process exited with code ${code}`))
+        }
+      })
+    }
+  )
 }
 
 export async function execCpToPod(
@@ -566,22 +566,30 @@ export async function execCpToPod(
   const delay = 1000
   for (let i = 0; i < attempts; i++) {
     try {
-      const want = await localCalculateOutputHashSorted([
-        'sh',
-        '-c',
-        listDirAllCommand(runnerPath)
-      ])
+      const { hash: want, lines: wantLines } =
+        await localCalculateOutputHashSorted([
+          'sh',
+          '-c',
+          listDirAllCommand(runnerPath)
+        ])
 
-      const got = await execCalculateOutputHashSorted(
-        podName,
-        JOB_CONTAINER_NAME,
-        ['sh', '-c', listDirAllCommand(containerPath)]
-      )
+      const { hash: got, lines: gotLines } =
+        await execCalculateOutputHashSorted(
+          podName,
+          JOB_CONTAINER_NAME,
+          ['sh', '-c', listDirAllCommand(containerPath)]
+        )
 
       if (got !== want) {
+        const wantSet = new Set(wantLines)
+        const gotSet = new Set(gotLines)
+        const onlyInWant = wantLines.filter(l => !gotSet.has(l))
+        const onlyInGot = gotLines.filter(l => !wantSet.has(l))
         core.debug(
           `The hash of the directory does not match the expected value; want='${want}' got='${got}'`
         )
+        core.debug(`only in runner (want): ${JSON.stringify(onlyInWant)}`)
+        core.debug(`only in pod (got):     ${JSON.stringify(onlyInGot)}`)
         await sleep(delay)
         continue
       }
@@ -669,22 +677,30 @@ export async function execCpFromPod(
   const delay = 1000
   for (let i = 0; i < attempts; i++) {
     try {
-      const want = await execCalculateOutputHashSorted(
-        podName,
-        JOB_CONTAINER_NAME,
-        ['sh', '-c', listDirAllCommand(containerPath)]
-      )
+      const { hash: want, lines: wantLines } =
+        await execCalculateOutputHashSorted(
+          podName,
+          JOB_CONTAINER_NAME,
+          ['sh', '-c', listDirAllCommand(containerPath)]
+        )
 
-      const got = await localCalculateOutputHashSorted([
-        'sh',
-        '-c',
-        listDirAllCommand(targetRunnerPath)
-      ])
+      const { hash: got, lines: gotLines } =
+        await localCalculateOutputHashSorted([
+          'sh',
+          '-c',
+          listDirAllCommand(targetRunnerPath)
+        ])
 
       if (got !== want) {
+        const wantSet = new Set(wantLines)
+        const gotSet = new Set(gotLines)
+        const onlyInWant = wantLines.filter(l => !gotSet.has(l))
+        const onlyInGot = gotLines.filter(l => !wantSet.has(l))
         core.debug(
           `The hash of the directory does not match the expected value; want='${want}' got='${got}'`
         )
+        core.debug(`only in pod (want):    ${JSON.stringify(onlyInWant)}`)
+        core.debug(`only in runner (got):  ${JSON.stringify(onlyInGot)}`)
         await sleep(delay)
         continue
       }
