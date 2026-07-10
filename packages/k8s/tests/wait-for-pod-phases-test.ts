@@ -7,7 +7,9 @@ import {
   getUnrecoverableEventReasons,
   getUnrecoverableTerminatedReasons,
   getUnrecoverableWaitingReasons,
+  isPermanentSchedulingFailure,
   parsePodPhase,
+  PERMANENT_SCHEDULING_PATTERNS,
   UNRECOVERABLE_EVENT_REASONS,
   UNRECOVERABLE_TERMINATED_REASONS,
   UNRECOVERABLE_WAITING_REASONS,
@@ -123,33 +125,49 @@ describe('getContainerErrors', () => {
     }
   })
 
-  it('includes the waiting message and a network/registry hint for ErrImagePull', () => {
+  it('includes retry-history and network hint for ImagePullBackOff', () => {
     const pod = buildPod(PodPhase.PENDING, {
       containerStatuses: [
         waitingContainer(
           'job',
-          'ErrImagePull',
+          'ImagePullBackOff',
           'Back-off pulling image "does-not-exist:latest"'
         )
       ]
     })
     const errors = getContainerErrors(pod)
     expect(errors).toHaveLength(1)
-    expect(errors[0]).toContain('  ✗ container "job": ErrImagePull')
+    expect(errors[0]).toContain('  ✗ container "job": ImagePullBackOff')
     expect(errors[0]).toContain('Back-off pulling image "does-not-exist:latest"')
     expect(errors[0]).toContain('registry')
-    expect(errors[0]).toContain('network')
+    expect(errors[0]).toContain('TLS')
+  })
+
+  it('does not fast-fail on ErrImagePull (treated as transient first-attempt)', () => {
+    // ErrImagePull fires on the first pull failure (could be a TLS timeout).
+    // k8s will retry and promote to ImagePullBackOff if it keeps failing.
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'ErrImagePull', 'TLS handshake timeout')]
+    })
+    expect(getContainerErrors(pod)).toEqual([])
+  })
+
+  it('does not fast-fail on CreateContainerError (treated as transient runtime issue)', () => {
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'CreateContainerError')]
+    })
+    expect(getContainerErrors(pod)).toEqual([])
   })
 
   it('inspects init containers as well as regular containers', () => {
     const pod = buildPod(PodPhase.PENDING, {
       initContainerStatuses: [waitingContainer('init', 'ImagePullBackOff')],
-      containerStatuses: [waitingContainer('job', 'CreateContainerError')]
+      containerStatuses: [waitingContainer('job', 'InvalidImageName')]
     })
     const errors = getContainerErrors(pod)
     expect(errors).toHaveLength(2)
     expect(errors[0]).toContain('  ✗ container "init": ImagePullBackOff')
-    expect(errors[1]).toContain('  ✗ container "job": CreateContainerError')
+    expect(errors[1]).toContain('  ✗ container "job": InvalidImageName')
   })
 
   it('ignores running/terminated containers and only collects waiting errors', () => {
@@ -211,13 +229,36 @@ describe('getPodEventErrors', () => {
     expect(errors[0]).toContain('PVC')
   })
 
-  it('ignores FailedScheduling events (scheduling is always treated as queuing)', async () => {
-    // FailedScheduling is not in UNRECOVERABLE_EVENT_REASONS — never fast-fails.
+  it('fast-fails on FailedScheduling with permanent config errors', async () => {
+    for (const msg of [
+      "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.",
+      '0/3 nodes are available: 3 node(s) had untolerated taint {gpu: true}.',
+      '0/3 nodes are available: persistentvolumeclaim "my-pvc" not found. preemption: 0/3'
+    ]) {
+      eventSpy.mockResolvedValue(
+        eventResult([buildEvent('FailedScheduling', msg)])
+      )
+      const errors = await getPodEventErrors('my-pod')
+      expect(errors).toHaveLength(1)
+      expect(errors[0]).toContain('  ✗ event: FailedScheduling')
+      expect(errors[0]).toContain('→')
+    }
+  })
+
+  it('does NOT fast-fail on FailedScheduling with resource shortages (keeps queuing)', async () => {
+    for (const msg of [
+      '0/3 nodes are available: 3 Insufficient nvidia.com/gpu.',
+      '0/5 nodes are available: 5 Insufficient memory.',
+      '0/1 nodes are available'
+    ]) {
+      eventSpy.mockResolvedValue(
+        eventResult([buildEvent('FailedScheduling', msg)])
+      )
+      expect(await getPodEventErrors('my-pod')).toEqual([])
+    }
+    // No message at all — unknown cause, treat as transient
     eventSpy.mockResolvedValue(
-      eventResult([
-        buildEvent('FailedScheduling', '0/3 nodes are available: 3 Insufficient nvidia.com/gpu.'),
-        buildEvent('FailedScheduling', "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.")
-      ])
+      eventResult([{ type: 'Warning', reason: 'FailedScheduling' } as k8s.CoreV1Event])
     )
     expect(await getPodEventErrors('my-pod')).toEqual([])
   })
@@ -274,6 +315,53 @@ describe('getPodEventErrors', () => {
   it('degrades gracefully when listing events is forbidden', async () => {
     eventSpy.mockRejectedValue(new Error('events is forbidden') as never)
     expect(await getPodEventErrors('my-pod')).toEqual([])
+  })
+})
+
+describe('isPermanentSchedulingFailure', () => {
+  it('returns true for node affinity/selector mismatch', () => {
+    expect(
+      isPermanentSchedulingFailure(
+        "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."
+      )
+    ).toBe(true)
+    expect(
+      isPermanentSchedulingFailure(
+        "0/5 nodes are available: 5 node(s) didn't match node affinity."
+      )
+    ).toBe(true)
+  })
+
+  it('returns true for untolerated taint', () => {
+    expect(
+      isPermanentSchedulingFailure(
+        '0/3 nodes are available: 3 node(s) had untolerated taint {gpu: true}.'
+      )
+    ).toBe(true)
+  })
+
+  it('returns true for PVC not found', () => {
+    expect(
+      isPermanentSchedulingFailure(
+        '0/3 nodes are available: persistentvolumeclaim "my-pvc" not found. preemption: 0/3'
+      )
+    ).toBe(true)
+  })
+
+  it('returns false for resource shortages (transient — keep queuing)', () => {
+    expect(isPermanentSchedulingFailure('0/3 nodes are available: 3 Insufficient nvidia.com/gpu.')).toBe(false)
+    expect(isPermanentSchedulingFailure('0/5 nodes are available: 5 Insufficient memory.')).toBe(false)
+    expect(isPermanentSchedulingFailure('0/2 nodes are available: 2 Insufficient cpu.')).toBe(false)
+  })
+
+  it('returns false for ambiguous / unknown messages (safe default: keep queuing)', () => {
+    expect(isPermanentSchedulingFailure('0/1 nodes are available')).toBe(false)
+    expect(isPermanentSchedulingFailure('preemption: 0/3 nodes are available')).toBe(false)
+    expect(isPermanentSchedulingFailure(undefined)).toBe(false)
+  })
+
+  it('PERMANENT_SCHEDULING_PATTERNS is non-empty', () => {
+    expect(PERMANENT_SCHEDULING_PATTERNS.length).toBeGreaterThan(0)
   })
 })
 
@@ -569,6 +657,33 @@ describe('waitForPodPhases', () => {
     ).rejects.toThrow(
       /has unrecoverable errors:[\s\S]*event: FailedMount \(x4\)/
     )
+  })
+
+  it('fast-fails on FailedScheduling with permanent message (PVC not found)', async () => {
+    readSpy.mockResolvedValue(podResult(buildPod(PodPhase.PENDING)))
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent(
+          'FailedScheduling',
+          '0/3 nodes are available: persistentvolumeclaim "missing-pvc" not found. preemption: 0/3'
+        )
+      ])
+    )
+    await expect(
+      waitForPodPhases('my-pod', new Set([PodPhase.RUNNING]), new Set([PodPhase.PENDING]))
+    ).rejects.toThrow(/has unrecoverable errors:[\s\S]*event: FailedScheduling/)
+  })
+
+  it('does NOT fast-fail on FailedScheduling with Insufficient resources (keeps polling)', async () => {
+    readSpy
+      .mockResolvedValueOnce(podResult(buildPod(PodPhase.PENDING)))
+      .mockResolvedValueOnce(podResult(buildPod(PodPhase.RUNNING)))
+    eventSpy.mockResolvedValue(
+      eventResult([buildEvent('FailedScheduling', '0/3 nodes are available: 3 Insufficient nvidia.com/gpu.')])
+    )
+    await expect(
+      waitForPodPhases('my-pod', new Set([PodPhase.RUNNING]), new Set([PodPhase.PENDING]))
+    ).resolves.toBeUndefined()
   })
 
   it('retries on transient readPod failure and recovers when pod becomes ready', async () => {
