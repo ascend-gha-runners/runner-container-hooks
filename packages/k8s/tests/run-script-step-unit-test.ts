@@ -105,4 +105,18 @@ describe('runScriptStep error classification', () => {
       /failed to run script step.*websocket connection dropped/
     )
   })
+
+  it('should throw error when state.jobPod is null (pod creation failed)', async () => {
+    const nullState = { jobPod: null }
+    await expect(runScriptStep(makeArgs(), nullState)).rejects.toThrow(
+      /jobPod must be set/
+    )
+  })
+
+  it('should throw error when state.jobPod is undefined (pod creation failed)', async () => {
+    const undefinedState = {}
+    await expect(runScriptStep(makeArgs(), undefinedState)).rejects.toThrow(
+      /jobPod must be set/
+    )
+  })
 })
