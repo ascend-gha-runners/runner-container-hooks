@@ -629,6 +629,14 @@ export async function execCpFromPod(
     `Copying from pod ${podName} ${containerPath} to ${targetRunnerPath}`
   )
 
+  // Clear target before extracting so deleted-on-pod files don't linger locally.
+  // tar.extract() appends into the destination; without this, stale files (e.g.
+  // git-credentials removed by checkout cleanup inside the pod) cause a permanent
+  // hash mismatch that no amount of retrying can resolve.
+  if (fs.existsSync(targetRunnerPath)) {
+    fs.rmSync(targetRunnerPath, { recursive: true, force: true })
+  }
+
   let attempt = 0
   while (true) {
     try {
