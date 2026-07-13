@@ -581,15 +581,32 @@ export async function execCpToPod(
         )
 
       if (got !== want) {
-        const wantSet = new Set(wantLines)
-        const gotSet = new Set(gotLines)
-        const onlyInWant = wantLines.filter(l => !gotSet.has(l))
-        const onlyInGot = gotLines.filter(l => !wantSet.has(l))
         core.debug(
-          `The hash of the directory does not match the expected value; want='${want}' got='${got}'`
+          `[cpToPod hash mismatch attempt ${i + 1}/${attempts}] want='${want}' got='${got}'`
         )
-        core.debug(`only in runner (want): ${JSON.stringify(onlyInWant)}`)
-        core.debug(`only in pod (got):     ${JSON.stringify(onlyInGot)}`)
+        core.debug(
+          `[cpToPod] runner file count=${wantLines.length} pod file count=${gotLines.length}`
+        )
+        const wantMap = new Map(
+          wantLines.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
+        )
+        const gotMap = new Map(
+          gotLines.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
+        )
+        const onlyInWant = wantLines.filter(l => !gotMap.has(l.replace(/^\d+ /, '')))
+        const onlyInGot = gotLines.filter(l => !wantMap.has(l.replace(/^\d+ /, '')))
+        const sizeDiff = wantLines
+          .filter(l => {
+            const name = l.replace(/^\d+ /, '')
+            return gotMap.has(name) && gotMap.get(name) !== wantMap.get(name)
+          })
+          .map(l => {
+            const name = l.replace(/^\d+ /, '')
+            return `${name}: runner=${wantMap.get(name)} pod=${gotMap.get(name)}`
+          })
+        core.debug(`[cpToPod] only in runner: ${JSON.stringify(onlyInWant)}`)
+        core.debug(`[cpToPod] only in pod:    ${JSON.stringify(onlyInGot)}`)
+        core.debug(`[cpToPod] size mismatch:  ${JSON.stringify(sizeDiff)}`)
         await sleep(delay)
         continue
       }
@@ -692,15 +709,32 @@ export async function execCpFromPod(
         ])
 
       if (got !== want) {
-        const wantSet = new Set(wantLines)
-        const gotSet = new Set(gotLines)
-        const onlyInWant = wantLines.filter(l => !gotSet.has(l))
-        const onlyInGot = gotLines.filter(l => !wantSet.has(l))
         core.debug(
-          `The hash of the directory does not match the expected value; want='${want}' got='${got}'`
+          `[cpFromPod hash mismatch attempt ${i + 1}/${attempts}] want='${want}' got='${got}'`
         )
-        core.debug(`only in pod (want):    ${JSON.stringify(onlyInWant)}`)
-        core.debug(`only in runner (got):  ${JSON.stringify(onlyInGot)}`)
+        core.debug(
+          `[cpFromPod] pod file count=${wantLines.length} runner file count=${gotLines.length}`
+        )
+        const wantMap = new Map(
+          wantLines.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
+        )
+        const gotMap = new Map(
+          gotLines.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
+        )
+        const onlyInWant = wantLines.filter(l => !gotMap.has(l.replace(/^\d+ /, '')))
+        const onlyInGot = gotLines.filter(l => !wantMap.has(l.replace(/^\d+ /, '')))
+        const sizeDiff = wantLines
+          .filter(l => {
+            const name = l.replace(/^\d+ /, '')
+            return gotMap.has(name) && gotMap.get(name) !== wantMap.get(name)
+          })
+          .map(l => {
+            const name = l.replace(/^\d+ /, '')
+            return `${name}: pod=${wantMap.get(name)} runner=${gotMap.get(name)}`
+          })
+        core.debug(`[cpFromPod] only in pod:    ${JSON.stringify(onlyInWant)}`)
+        core.debug(`[cpFromPod] only in runner: ${JSON.stringify(onlyInGot)}`)
+        core.debug(`[cpFromPod] size mismatch:  ${JSON.stringify(sizeDiff)}`)
         await sleep(delay)
         continue
       }
