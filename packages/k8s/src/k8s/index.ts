@@ -656,6 +656,12 @@ export async function execCpFromPod(
       const errStream = new WritableStreamBuffer()
 
       await new Promise((resolve, reject) => {
+        // Resolve only after writerStream finishes flushing to disk.
+        // The k8s status callback fires when the pod-side tar process exits,
+        // but tar-fs may still be writing buffered data to the local filesystem.
+        // Waiting for 'finish' ensures all files are on disk before hash check.
+        writerStream.on('finish', resolve)
+        writerStream.on('error', reject)
         exec
           .exec(
             namespace(),
@@ -666,7 +672,7 @@ export async function execCpFromPod(
             errStream,
             null,
             false,
-            async status => {
+            async _status => {
               if (errStream.size()) {
                 reject(
                   new Error(
@@ -674,7 +680,6 @@ export async function execCpFromPod(
                   )
                 )
               }
-              resolve(status)
             }
           )
           .catch(e => reject(e))
