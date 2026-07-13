@@ -521,7 +521,7 @@ export async function execCpToPod(
         `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
           `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
           `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null; ` +
-          `sync`
+          `sync 2>/dev/null || true`
       ]
       const readStream = tar.pack(runnerPath)
       const errStream = new WritableStreamBuffer()
@@ -696,12 +696,6 @@ export async function execCpFromPod(
       await sleep(1000)
     }
   }
-
-  await new Promise<void>(resolve => {
-    const child = spawn('sync', [], { stdio: 'ignore' })
-    child.on('close', () => resolve())
-    child.on('error', () => resolve())
-  })
 
   let attempts = 15
   const delay = 1000
