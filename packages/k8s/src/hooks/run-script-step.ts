@@ -31,6 +31,13 @@ export async function runScriptStep(
   args: RunScriptStepArgs,
   state
 ): Promise<void> {
+  // Validate that pod was created successfully (prepareJob succeeded)
+  if (!state?.jobPod) {
+    throw new Error(
+      'jobPod must be set - ensure prepareJob completed successfully before running script steps'
+    )
+  }
+
   // Write the entrypoint first. This will be later coppied to the workflow pod
   const { entryPoint, entryPointArgs, environmentVariables } = args
   const { containerPath, runnerPath } = writeRunScript(
