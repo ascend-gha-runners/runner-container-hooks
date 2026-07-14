@@ -1355,6 +1355,8 @@ export async function checkUnrecoverableErrors(
 ): Promise<string[]> {
   // Deterministic terminal errors on a container (e.g. ImagePullBackOff).
   const containerErrors = getContainerErrors(pod)
+  // Terminated container errors (e.g. OOMKilled, non-zero exit) with hints.
+  const terminatedErrors = getContainerTerminatedErrors(pod)
   // Best-effort: returns [] when the optional events RBAC permission is absent.
   const eventErrors = await getPodEventErrors(podName)
   // Conditions are set near-instantly by the scheduler while events may take
@@ -1363,7 +1365,7 @@ export async function checkUnrecoverableErrors(
   const conditionErrors = getPodConditionErrors(pod).filter(
     c => !eventErrors.some(e => e.includes('FailedScheduling') && c.includes('Unschedulable'))
   )
-  return [...containerErrors, ...eventErrors, ...conditionErrors]
+  return [...containerErrors, ...terminatedErrors, ...eventErrors, ...conditionErrors]
 }
 
 export async function waitForPodPhases(
@@ -1404,9 +1406,18 @@ export async function waitForPodPhases(
     }
 
     // The pod reached a phase we are not willing to keep waiting on
-    // (a terminal/unhealthy phase). Attach full diagnostics and stop.
+    // (a terminal/unhealthy phase). First check for unrecoverable
+    // container-level errors (e.g. OOMKilled, non-zero exit) so they are
+    // reported with actionable hints. Fall back to the generic "is unhealthy"
+    // message when no specific error is found.
     if (!backOffPhases.has(phase)) {
+      const errors = await checkUnrecoverableErrors(pod, podName)
       const details = await describePodFailure(podName)
+      if (errors.length > 0) {
+        throw new Error(
+          `Pod ${podName} has unrecoverable errors:\n${errors.join('\n')}\n${'─'.repeat(60)}\n${details}`
+        )
+      }
       throw new Error(
         `Pod ${podName} is unhealthy (phase: ${phase})\n${'─'.repeat(60)}\n${details}`
       )
