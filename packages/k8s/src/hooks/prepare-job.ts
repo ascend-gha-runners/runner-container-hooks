@@ -126,7 +126,17 @@ export async function prepareJob(
     } catch {
       // Parsing failed — fall through and show the raw string
     }
-    throw new Error(`failed to create job pod:\n  ${detail}`)
+    const errorMessage = [
+      'failed to create job pod:',
+      `  ✗ ${detail}`,
+      '-'.repeat(60),
+      '  → Pod spec was rejected by the k8s API. Check:',
+      '    - resources.requests does not exceed resources.limits',
+      '    - volumeMounts reference a volume defined in spec.volumes',
+      '    - envFrom / valueFrom reference existing Secrets / ConfigMaps',
+      '    - Field types match the k8s schema (kubectl explain pod.spec.containers)'
+    ].join('\n')
+    throw new Error(errorMessage)
   }
 
   if (!createdPod?.metadata?.name) {

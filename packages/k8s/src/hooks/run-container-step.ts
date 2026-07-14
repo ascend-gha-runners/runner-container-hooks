@@ -173,7 +173,7 @@ async function classifyScriptError(
   exitCode: number,
   tailOutput: string
 ): Promise<string> {
-  const sep = '─'.repeat(60)
+  const sep = '-'.repeat(60)
   const errors: string[] = [`  ✗ exit code: ${exitCode}`]
   const sections: string[] = []
 
