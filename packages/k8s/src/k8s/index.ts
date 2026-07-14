@@ -1395,7 +1395,7 @@ export async function waitForPodPhases(
         throw new Error(
           `Pod ${podName} timed out after ${maxTimeSeconds}s (pod read failed: ${
             err instanceof Error ? err.message : String(err)
-          })\n${'─'.repeat(60)}\n(pod was unreadable; no further diagnostics available)`
+          })\n${'-'.repeat(60)}\n(pod was unreadable; no further diagnostics available)`
         )
       }
       continue
@@ -1415,11 +1415,11 @@ export async function waitForPodPhases(
       const details = await describePodFailure(podName)
       if (errors.length > 0) {
         throw new Error(
-          `Pod ${podName} has unrecoverable errors:\n${errors.join('\n')}\n${'─'.repeat(60)}\n${details}`
+          `Pod ${podName} has unrecoverable errors:\n${errors.join('\n')}\n${'-'.repeat(60)}\n${details}`
         )
       }
       throw new Error(
-        `Pod ${podName} is unhealthy (phase: ${phase})\n${'─'.repeat(60)}\n${details}`
+        `Pod ${podName} is unhealthy (phase: ${phase})\n${'-'.repeat(60)}\n${details}`
       )
     }
 
@@ -1430,7 +1430,7 @@ export async function waitForPodPhases(
     if (errors.length > 0) {
       const details = await describePodFailure(podName)
       throw new Error(
-        `Pod ${podName} has unrecoverable errors:\n${errors.join('\n')}\n${'─'.repeat(60)}\n${details}`
+        `Pod ${podName} has unrecoverable errors:\n${errors.join('\n')}\n${'-'.repeat(60)}\n${details}`
       )
     }
 
@@ -1442,7 +1442,7 @@ export async function waitForPodPhases(
       // can see WHY the pod never became ready.
       const details = await describePodFailure(podName)
       throw new Error(
-        `Pod ${podName} timed out after ${maxTimeSeconds}s (phase: ${phase})\n${'─'.repeat(60)}\n${details}`
+        `Pod ${podName} timed out after ${maxTimeSeconds}s (phase: ${phase})\n${'-'.repeat(60)}\n${details}`
       )
     }
   }

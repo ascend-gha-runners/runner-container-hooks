@@ -9,7 +9,7 @@ import { dirname } from 'path'
 import * as shlex from 'shlex'
 
 function formatScriptError(exitCode: number, tailOutput: string): string {
-  const sep = '─'.repeat(60)
+  const sep = '-'.repeat(60)
   const errors = [
     `  ✗ exit code: ${exitCode}`,
     `  → your script exited with a non-zero code; please check your script for errors`
