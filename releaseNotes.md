@@ -1,24 +1,21 @@
-## Features
-
-- k8s: Use pod affinity when KubeScheduler is enabled [#212]
-- docker: support alternative network modes [#209]
+<!-- ## Features -->
 
 ## Bugs
 
-- Expose CI=true and GITHUB_ACTIONS env variables [#215]
-- k8s: add /github/home to containerAction mounts and surface createSecretForEnvs errors [#198]
-- k8s: start logging from the beginning [#184]
+- Change command to remove sudo to fix fs-init initial container [#263]
+- Sort 'find' output before hashing for consistency [#267]
+- feat: check if required binaries are present [#272]
+- Allow non-root container [#264]
+- Improve validation checks after copying [#285]
+- Fix workingDir permissions issue by creating it within init container [#283]
+- Fix event.json not being copied to /github/workflow in kubernetes-novolume mode [#287]
+- Reduce the amount of data copied to the workflow pod [#293]
+- Overwrite runner file commands [#298]
 
 ## Misc
 
-- Bump node in tests to node 22 since node14 is quite old [#216]
-- Bump jsonpath-plus from 10.1.0 to 10.3.0 in /packages/k8s [#213]
-- Bump braces from 3.0.2 to 3.0.3 in /packages/hooklib [#194]
-- Bump cross-spawn from 7.0.3 to 7.0.6 in /packages/k8s [#196]
-- Bump ws from 7.5.8 to 7.5.10 in /packages/k8s [#192]
-- Remove dependency on deprecated release actions [#193]
-- Update to the latest available actions [#191]
-
+- Dependency updates [#276] [#277] [#278] [#279] [#304]
+- Group dependabot updates [#289]
 
 ## SHA-256 Checksums
 
