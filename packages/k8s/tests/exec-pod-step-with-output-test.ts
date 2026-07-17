@@ -165,7 +165,17 @@ describe('execPodStepWithOutput', () => {
 
   it('keeps stdout and stderr pending buffers independent (no interleaving)', async () => {
     execSpy.mockImplementation(
-      async (_ns, _pod, _container, _cmd, stdout, stderr, _stdin, _tty, callback) => {
+      async (
+        _ns,
+        _pod,
+        _container,
+        _cmd,
+        stdout,
+        stderr,
+        _stdin,
+        _tty,
+        callback
+      ) => {
         // Write partial lines to both streams without a newline delimiter.
         // If the pending buffers were shared, "out partial" and "err partial"
         // would be concatenated into one corrupted line.
