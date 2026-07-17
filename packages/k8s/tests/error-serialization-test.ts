@@ -164,7 +164,8 @@ describe('error serialization', () => {
         waitForPodPhases(
           'test-pod',
           new Set([PodPhase.RUNNING]),
-          new Set([PodPhase.PENDING])
+          new Set([PodPhase.PENDING]),
+          1
         )
       ).rejects.toThrow('network timeout')
     })
@@ -176,7 +177,8 @@ describe('error serialization', () => {
         await waitForPodPhases(
           'test-pod',
           new Set([PodPhase.RUNNING]),
-          new Set([PodPhase.PENDING])
+          new Set([PodPhase.PENDING]),
+          1
         )
         fail('Expected waitForPodPhases to throw')
       } catch (error) {
