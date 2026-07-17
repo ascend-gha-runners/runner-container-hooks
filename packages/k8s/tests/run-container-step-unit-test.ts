@@ -184,12 +184,10 @@ describe('runContainerStep — script execution paths', () => {
       .spyOn(k8sModule, 'execPodStepWithOutput')
       .mockResolvedValue({ code: 0, output: '' })
 
-    getPodByNameSpy = jest
-      .spyOn(k8sModule, 'getPodByName')
-      .mockResolvedValue({
-        metadata: { name: 'step-pod-abc' },
-        status: {}
-      } as k8s.V1Pod)
+    getPodByNameSpy = jest.spyOn(k8sModule, 'getPodByName').mockResolvedValue({
+      metadata: { name: 'step-pod-abc' },
+      status: {}
+    } as k8s.V1Pod)
 
     getContainerTerminatedErrorsSpy = jest
       .spyOn(k8sModule, 'getContainerTerminatedErrors')
