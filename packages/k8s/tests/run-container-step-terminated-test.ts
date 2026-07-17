@@ -44,12 +44,12 @@ function makeMinimalArgs(): RunContainerStepArgs {
 }
 
 describe('runContainerStep terminated error detection', () => {
-  let createStepPodSpy: jest.SpyInstance
-  let waitForPodPhasesSpy: jest.SpyInstance
+  let _createStepPodSpy: jest.SpyInstance
+  let _waitForPodPhasesSpy: jest.SpyInstance
   let getPodByNameSpy: jest.SpyInstance
   let getContainerTerminatedErrorsSpy: jest.SpyInstance
   let describePodFailureSpy: jest.SpyInstance
-  let deletePodSpy: jest.SpyInstance
+  let _deletePodSpy: jest.SpyInstance
   let coreErrorSpy: jest.SpyInstance
 
   beforeEach(() => {
@@ -58,13 +58,13 @@ describe('runContainerStep terminated error detection', () => {
     process.env['GITHUB_WORKSPACE'] = '/tmp/runner/_work/repo/repo'
     process.env['ACTIONS_RUNNER_POD_NAME'] = 'test-runner-pod'
 
-    createStepPodSpy = jest
+    _createStepPodSpy = jest
       .spyOn(k8sModule, 'createContainerStepPod')
       .mockResolvedValue({
         metadata: { name: 'test-step-pod' }
       } as k8s.V1Pod)
 
-    waitForPodPhasesSpy = jest
+    _waitForPodPhasesSpy = jest
       .spyOn(k8sModule, 'waitForPodPhases')
       .mockRejectedValue(
         new Error('Pod test-step-pod has unrecoverable errors')
@@ -83,7 +83,7 @@ describe('runContainerStep terminated error detection', () => {
         'Pod status: Failed\nContainer details:\n  ✗ container "job" terminated: OOMKilled (exit code 137)'
       )
 
-    deletePodSpy = jest
+    _deletePodSpy = jest
       .spyOn(k8sModule, 'deletePod')
       .mockResolvedValue(undefined)
 

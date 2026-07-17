@@ -5,7 +5,6 @@
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import * as core from '@actions/core'
 import * as k8s from '@kubernetes/client-node'
 
 jest.mock('@actions/core', () => ({
@@ -185,7 +184,6 @@ describe('prepareJob error paths', () => {
   let createJobPodSpy: jest.SpyInstance
   let waitForPodPhasesSpy: jest.SpyInstance
   let isPodContainerAlpineSpy: jest.SpyInstance
-  let execCpToPodSpy: jest.SpyInstance
 
   beforeEach(() => {
     tmpDir = makeTmpDir()
@@ -214,9 +212,7 @@ describe('prepareJob error paths', () => {
     isPodContainerAlpineSpy = jest
       .spyOn(k8sModule, 'isPodContainerAlpine')
       .mockResolvedValue(false)
-    execCpToPodSpy = jest
-      .spyOn(k8sModule, 'execCpToPod')
-      .mockResolvedValue(undefined)
+    jest.spyOn(k8sModule, 'execCpToPod').mockResolvedValue(undefined)
   })
 
   afterEach(() => {
@@ -307,7 +303,7 @@ describe('prepareJob error paths', () => {
       { image: 'redis:latest', portMappings: [], environmentVariables: {} },
       { image: 'redis:latest', portMappings: [], environmentVariables: {} }
     ]
-    createJobPodSpy.mockImplementation((_name, _container, services) => {
+    createJobPodSpy.mockImplementation(async (_name, _container, services) => {
       // Return a pod with the service containers echoed back
       return Promise.resolve({
         metadata: { name: 'job-pod-xyz' },

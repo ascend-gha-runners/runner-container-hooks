@@ -5,7 +5,6 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 import * as k8s from '@kubernetes/client-node'
-import * as core from '@actions/core'
 import { RunContainerStepArgs } from 'hooklib'
 import { runContainerStep } from '../src/hooks/run-container-step'
 import * as k8sModule from '../src/k8s'
@@ -145,8 +144,6 @@ describe('runContainerStep — script execution paths', () => {
   let tmpDir: string
   let execPodStepWithOutputSpy: jest.SpyInstance
   let getPodByNameSpy: jest.SpyInstance
-  let getContainerTerminatedErrorsSpy: jest.SpyInstance
-  let describePodFailureSpy: jest.SpyInstance
   let deletePodSpy: jest.SpyInstance
 
   beforeEach(() => {
@@ -189,13 +186,9 @@ describe('runContainerStep — script execution paths', () => {
       status: {}
     } as k8s.V1Pod)
 
-    getContainerTerminatedErrorsSpy = jest
-      .spyOn(k8sModule, 'getContainerTerminatedErrors')
-      .mockReturnValue([])
+    jest.spyOn(k8sModule, 'getContainerTerminatedErrors').mockReturnValue([])
 
-    describePodFailureSpy = jest
-      .spyOn(k8sModule, 'describePodFailure')
-      .mockResolvedValue('pod details')
+    jest.spyOn(k8sModule, 'describePodFailure').mockResolvedValue('pod details')
 
     deletePodSpy = jest
       .spyOn(k8sModule, 'deletePod')

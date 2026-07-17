@@ -388,7 +388,7 @@ export async function execPodStepWithOutput(
 
   // Ring buffer of the last N non-empty lines (cap to keep memory bounded).
   const buffer: string[] = []
-  const push = (line: string) => {
+  const push = (line: string): void => {
     if (line.length === 0) return
     buffer.push(line)
     if (buffer.length > tailLines) buffer.shift()
@@ -396,7 +396,7 @@ export async function execPodStepWithOutput(
 
   // Separate pending buffers per stream to prevent stdout/stderr interleaving.
   let pendingOut = ''
-  const ingestOut = (chunk: Buffer | string) => {
+  const ingestOut = (chunk: Buffer | string): void => {
     pendingOut += chunk.toString('utf8')
     const lines = pendingOut.split(/\r?\n/)
     pendingOut = lines.pop() ?? ''
@@ -404,14 +404,14 @@ export async function execPodStepWithOutput(
   }
 
   let pendingErr = ''
-  const ingestErr = (chunk: Buffer | string) => {
+  const ingestErr = (chunk: Buffer | string): void => {
     pendingErr += chunk.toString('utf8')
     const lines = pendingErr.split(/\r?\n/)
     pendingErr = lines.pop() ?? ''
     for (const line of lines) push(line)
   }
 
-  const flushPending = () => {
+  const flushPending = (): void => {
     if (pendingOut) {
       push(pendingOut)
       pendingOut = ''
@@ -770,7 +770,7 @@ export async function execCpFromPod(
             errStream,
             null,
             false,
-            async _status => {
+            async (_s: k8s.V1Status) => {
               if (errStream.size()) {
                 return reject(
                   new Error(
@@ -1456,7 +1456,7 @@ async function describePodWarningEvents(podName: string): Promise<string[]> {
 // until the timeout, not terminate early. This function always returns [] as a
 // result, but is kept so checkUnrecoverableErrors compiles and the dedup logic
 // remains intact for future use.
-export function getPodConditionErrors(_pod: k8s.V1Pod): string[] {
+export function getPodConditionErrors(_p: k8s.V1Pod): string[] {
   return []
 }
 
@@ -1561,7 +1561,7 @@ export async function waitForPodPhases(
 
     try {
       await backOffManager.backOff()
-    } catch (error) {
+    } catch (_err) {
       // BackOffManager throws "backoff timeout" when maxTimeSeconds is exceeded.
       // Don't surface that bare message: collect diagnostics first so the user
       // can see WHY the pod never became ready.

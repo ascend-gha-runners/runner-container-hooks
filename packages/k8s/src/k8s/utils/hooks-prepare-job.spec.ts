@@ -303,7 +303,7 @@ describe('prepareJob', () => {
       { image: 'redis:latest', portMappings: [], environmentVariables: {} }
     ]
     vi.mocked(k8sMod.createJobPod).mockImplementation(
-      (_name, _container, services) =>
+      async (_name, _container, services) =>
         Promise.resolve({
           metadata: { name: 'job-pod' },
           spec: {

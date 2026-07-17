@@ -46,7 +46,7 @@ describe('parsePositiveMsEnv', () => {
 // ── WebSocketHeartbeat ────────────────────────────────────────────────────────
 
 function makeMockWs() {
-  const listeners: Record<string, Array<(...args: any[]) => void>> = {}
+  const listeners: Record<string, ((...args: any[]) => void)[]> = {}
   return {
     readyState: 1,
     ping: vi.fn(),

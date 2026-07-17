@@ -1,5 +1,4 @@
 import * as k8s from '@kubernetes/client-node'
-import * as core from '@actions/core'
 import { execPodStepWithOutput } from '../src/k8s'
 
 jest.mock('@actions/core', () => ({
@@ -24,7 +23,7 @@ describe('execPodStepWithOutput', () => {
 
   it('resolves with code 0 and captured stdout on success', async () => {
     execSpy.mockImplementation(
-      (
+      async (
         _ns,
         _pod,
         _container,
@@ -53,7 +52,7 @@ describe('execPodStepWithOutput', () => {
 
   it('resolves with exit code when exec() promise rejects with non-zero exit message', async () => {
     // This is the k8s client v1.x path: exec() rejects directly, callback never fires.
-    execSpy.mockImplementation((_ns, _pod, _container, _cmd, stdout) => {
+    execSpy.mockImplementation(async (_ns, _pod, _container, _cmd, stdout) => {
       stdout.write('some output before fail\n')
       return Promise.reject(
         new Error(
@@ -72,7 +71,7 @@ describe('execPodStepWithOutput', () => {
 
   it('resolves with exit code from Failure status callback', async () => {
     execSpy.mockImplementation(
-      (
+      async (
         _ns,
         _pod,
         _container,
@@ -111,7 +110,7 @@ describe('execPodStepWithOutput', () => {
 
   it('rejects on Failure callback with no exit code in message', async () => {
     execSpy.mockImplementation(
-      (
+      async (
         _ns,
         _pod,
         _container,
@@ -133,7 +132,7 @@ describe('execPodStepWithOutput', () => {
 
   it('retains only the last tailLines lines in the output buffer', async () => {
     execSpy.mockImplementation(
-      (
+      async (
         _ns,
         _pod,
         _container,
@@ -166,7 +165,7 @@ describe('execPodStepWithOutput', () => {
 
   it('keeps stdout and stderr pending buffers independent (no interleaving)', async () => {
     execSpy.mockImplementation(
-      (_ns, _pod, _container, _cmd, stdout, stderr, _stdin, _tty, callback) => {
+      async (_ns, _pod, _container, _cmd, stdout, stderr, _stdin, _tty, callback) => {
         // Write partial lines to both streams without a newline delimiter.
         // If the pending buffers were shared, "out partial" and "err partial"
         // would be concatenated into one corrupted line.
