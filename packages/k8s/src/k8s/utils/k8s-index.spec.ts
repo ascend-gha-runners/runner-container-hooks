@@ -23,8 +23,8 @@ import {
   deletePod,
   createJobPod,
   createContainerStepPod
-} from './index'
-import { PodPhase } from './utils'
+} from '../index'
+import { PodPhase } from './index'
 
 vi.mock('@actions/core', () => ({
   debug: vi.fn(),

@@ -1,4 +1,4 @@
-import { parsePositiveMsEnv, WebSocketHeartbeat } from './heartbeat'
+import { parsePositiveMsEnv, WebSocketHeartbeat } from '../heartbeat'
 
 vi.mock('@actions/core', () => ({
   debug: vi.fn(),

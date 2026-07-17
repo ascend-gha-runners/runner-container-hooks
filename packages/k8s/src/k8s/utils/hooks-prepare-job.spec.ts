@@ -10,7 +10,7 @@ vi.mock('@actions/core', () => ({
   info: vi.fn()
 }))
 
-vi.mock('../k8s', () => ({
+vi.mock('../index', () => ({
   containerPorts: vi.fn().mockReturnValue([]),
   createJobPod: vi.fn(),
   execCpToPod: vi.fn().mockResolvedValue(undefined),
@@ -21,10 +21,10 @@ vi.mock('../k8s', () => ({
   getPrepareJobTimeoutSeconds: vi.fn().mockReturnValue(60)
 }))
 
-import { createContainerSpec, prepareJob } from './prepare-job'
-import * as k8sMod from '../k8s'
-import { JOB_CONTAINER_NAME } from './constants'
-import { CONTAINER_VOLUMES } from '../k8s/utils'
+import { createContainerSpec, prepareJob } from '../../hooks/prepare-job'
+import * as k8sMod from '../index'
+import { JOB_CONTAINER_NAME } from '../../hooks/constants'
+import { CONTAINER_VOLUMES } from './index'
 
 function makeTmpDir(): string {
   const d = path.join(os.tmpdir(), `pj-spec-${Date.now()}`)

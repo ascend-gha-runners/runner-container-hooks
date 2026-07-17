@@ -11,7 +11,7 @@ vi.mock('@actions/core', () => ({
   info: vi.fn()
 }))
 
-vi.mock('../k8s', () => ({
+vi.mock('../index', () => ({
   createContainerStepPod: vi.fn(),
   deletePod: vi.fn().mockResolvedValue(undefined),
   describePodFailure: vi.fn().mockResolvedValue(''),
@@ -25,8 +25,8 @@ vi.mock('../k8s', () => ({
   waitForPodPhases: vi.fn().mockResolvedValue(undefined)
 }))
 
-vi.mock('../k8s/utils', async importOriginal => {
-  const real = await importOriginal<typeof import('../k8s/utils')>()
+vi.mock('./index', async importOriginal => {
+  const real = await importOriginal<typeof import('./index')>()
   return {
     ...real,
     writeContainerStepScript: vi.fn().mockReturnValue({
@@ -36,8 +36,8 @@ vi.mock('../k8s/utils', async importOriginal => {
   }
 })
 
-import { runContainerStep } from './run-container-step'
-import * as k8sMod from '../k8s'
+import { runContainerStep } from '../../hooks/run-container-step'
+import * as k8sMod from '../index'
 
 function makeTmpDir(): string {
   const d = path.join(os.tmpdir(), `rcs-spec-${Date.now()}`)

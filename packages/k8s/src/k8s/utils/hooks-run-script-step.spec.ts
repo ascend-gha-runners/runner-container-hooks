@@ -9,15 +9,15 @@ vi.mock('@actions/core', () => ({
   info: vi.fn()
 }))
 
-vi.mock('../k8s', () => ({
+vi.mock('../index', () => ({
   execPodStep: vi.fn().mockResolvedValue(0),
   execCpToPod: vi.fn().mockResolvedValue(undefined),
   execCpFromPod: vi.fn().mockResolvedValue(undefined),
   execPodStepWithOutput: vi.fn().mockResolvedValue({ code: 0, output: '' })
 }))
 
-import { runScriptStep } from './run-script-step'
-import * as k8sMod from '../k8s'
+import { runScriptStep } from '../../hooks/run-script-step'
+import * as k8sMod from '../index'
 
 function makeTmpDir(): string {
   const d = path.join(os.tmpdir(), `rss-spec-${Date.now()}`)
