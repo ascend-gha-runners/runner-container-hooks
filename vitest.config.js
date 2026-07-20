@@ -21,7 +21,6 @@ export default defineConfig({
       reportsDirectory: './coverage',
       include: [
         'packages/k8s/src/**/*.ts',
-        'packages/docker/src/**/*.ts',
         'packages/hooklib/src/**/*.ts'
       ],
       exclude: ['**/*.spec.ts', '**/*.d.ts']

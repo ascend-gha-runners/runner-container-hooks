@@ -32,7 +32,12 @@ import {
   isAuthPermissionsOK,
   execCalculateOutputHashSorted,
   localCalculateOutputHashSorted,
-  isPodContainerAlpine
+  isPodContainerAlpine,
+  containerPorts,
+  getPodLogs,
+  getPodByName,
+  execPodStepWithOutput,
+  execPodStep
 } from '../index'
 import { PodPhase } from './index'
 
@@ -1499,4 +1504,343 @@ describe('getContainerErrors — getWaitingReasonHint additional branches', () =
     const errors = getContainerErrors(pod)
     expect(errors[0]).toContain('malformed')
   })
+})
+
+// ── containerPorts ────────────────────────────────────────────────────────────
+
+describe('containerPorts', () => {
+  it('returns empty array when portMappings is absent', () => {
+    expect(containerPorts({} as any)).toEqual([])
+    expect(containerPorts({ portMappings: [] } as any)).toEqual([])
+  })
+
+  it('parses a simple containerPort', () => {
+    const ports = containerPorts({ portMappings: ['8080'] } as any)
+    expect(ports).toHaveLength(1)
+    expect(ports[0].containerPort).toBe(8080)
+    expect(ports[0].protocol).toBe('TCP')
+  })
+
+  it('parses hostPort:containerPort format', () => {
+    const ports = containerPorts({ portMappings: ['80:8080'] } as any)
+    expect(ports[0].hostPort).toBe(80)
+    expect(ports[0].containerPort).toBe(8080)
+  })
+
+  it('parses protocol suffix', () => {
+    const ports = containerPorts({ portMappings: ['8080/UDP'] } as any)
+    expect(ports[0].protocol).toBe('UDP')
+    expect(ports[0].containerPort).toBe(8080)
+  })
+
+  it('parses hostPort:containerPort/protocol', () => {
+    const ports = containerPorts({ portMappings: ['80:8080/TCP'] } as any)
+    expect(ports[0].hostPort).toBe(80)
+    expect(ports[0].containerPort).toBe(8080)
+    expect(ports[0].protocol).toBe('TCP')
+  })
+
+  it('throws on too many slashes', () => {
+    expect(() =>
+      containerPorts({ portMappings: ['80/TCP/extra'] } as any)
+    ).toThrow('Unexpected port format')
+  })
+
+  it('throws on too many colons', () => {
+    expect(() =>
+      containerPorts({ portMappings: ['80:8080:9090'] } as any)
+    ).toThrow('":" separator')
+  })
+
+  it('throws on invalid port number', () => {
+    expect(() =>
+      containerPorts({ portMappings: ['0'] } as any)
+    ).toThrow('invalid container port')
+    expect(() =>
+      containerPorts({ portMappings: ['65536'] } as any)
+    ).toThrow('invalid container port')
+    expect(() =>
+      containerPorts({ portMappings: ['abc'] } as any)
+    ).toThrow('invalid container port')
+  })
+
+  it('parses multiple port mappings', () => {
+    const ports = containerPorts({
+      portMappings: ['80:8080', '443:8443/TCP']
+    } as any)
+    expect(ports).toHaveLength(2)
+    expect(ports[0].containerPort).toBe(8080)
+    expect(ports[1].containerPort).toBe(8443)
+  })
+})
+
+// ── execPodStepWithOutput ─────────────────────────────────────────────────────
+
+describe('execPodStepWithOutput', () => {
+  let execSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    execSpy = vi.spyOn(k8s.Exec.prototype, 'exec' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('resolves with code 0 and captured output on success', async () => {
+    execSpy.mockImplementation(async function (
+      this: any,
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
+    ) {
+      stdout.write('hello\nworld\n')
+      void Promise.resolve().then(() =>
+        statusCb({ status: 'Success', code: 0 })
+      )
+      return Promise.resolve({})
+    })
+    const result = await execPodStepWithOutput(
+      ['sh', '-c', 'echo hi'],
+      'my-pod',
+      'job'
+    )
+    expect(result.code).toBe(0)
+    expect(result.output).toContain('hello')
+  })
+
+  it('resolves with parsed exit code from Failure message', async () => {
+    execSpy.mockImplementation(async function (
+      this: any,
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      _stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
+    ) {
+      void Promise.resolve().then(() =>
+        statusCb({
+          status: 'Failure',
+          message: 'command terminated with exit code 1'
+        })
+      )
+      return Promise.resolve({})
+    })
+    const result = await execPodStepWithOutput(
+      ['sh', '-c', 'exit 1'],
+      'my-pod',
+      'job'
+    )
+    expect(result.code).toBe(1)
+  })
+
+  it('rejects when Failure has no parseable exit code', async () => {
+    execSpy.mockImplementation(async function (
+      this: any,
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      _stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
+    ) {
+      void Promise.resolve().then(() =>
+        statusCb({ status: 'Failure', message: 'unexpected error' })
+      )
+      return Promise.resolve({})
+    })
+    await expect(
+      execPodStepWithOutput(['sh', '-c', 'fail'], 'my-pod', 'job')
+    ).rejects.toThrow('unexpected error')
+  })
+
+  it('resolves with parsed code when exec promise rejects with exit code message', async () => {
+    execSpy.mockRejectedValue(
+      new Error('command terminated with exit code 2') as never
+    )
+    const result = await execPodStepWithOutput(
+      ['sh', '-c', 'exit 2'],
+      'my-pod',
+      'job'
+    )
+    expect(result.code).toBe(2)
+  })
+
+  it('rejects when exec promise rejects without exit code', async () => {
+    execSpy.mockRejectedValue(new Error('connection refused') as never)
+    await expect(
+      execPodStepWithOutput(['ls'], 'my-pod', 'job')
+    ).rejects.toThrow('connection refused')
+  })
+})
+
+// ── getPodLogs ────────────────────────────────────────────────────────────────
+
+describe('getPodLogs', () => {
+  let logSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    logSpy = vi.spyOn(k8s.Log.prototype, 'log' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('resolves when log stream ends normally', async () => {
+    logSpy.mockImplementation(
+      async (_ns, _pod, _c, logStream, _opts) => {
+        void Promise.resolve().then(() => logStream.end())
+        return undefined
+      }
+    )
+    await expect(getPodLogs('my-pod', 'job')).resolves.toBeUndefined()
+  })
+
+  it('rejects when log stream emits an error', async () => {
+    logSpy.mockImplementation(
+      async (_ns, _pod, _c, logStream, _opts) => {
+        void Promise.resolve().then(() =>
+          logStream.destroy(new Error('stream error'))
+        )
+        return undefined
+      }
+    )
+    await expect(getPodLogs('my-pod', 'job')).rejects.toThrow('stream error')
+  })
+})
+
+// ── getPodByName ──────────────────────────────────────────────────────────────
+
+describe('getPodByName', () => {
+  let readSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    readSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'readNamespacedPod' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('returns the pod from the API', async () => {
+    const fakePod = buildPod('Running')
+    readSpy.mockResolvedValue(fakePod as never)
+    const pod = await getPodByName('my-pod')
+    expect(readSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'my-pod', namespace: 'default' })
+    )
+    expect(pod).toBe(fakePod)
+  })
+
+  it('propagates API errors', async () => {
+    readSpy.mockRejectedValue(new Error('not found') as never)
+    await expect(getPodByName('missing-pod')).rejects.toThrow('not found')
+  })
+})
+
+// ── execPodStep ───────────────────────────────────────────────────────────────
+
+describe('execPodStep', () => {
+  let execSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    execSpy = vi.spyOn(k8s.Exec.prototype, 'exec' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('resolves with exit code 0 on Success', async () => {
+    execSpy.mockImplementation(async function (
+      this: any,
+      _ns, _pod, _c, _cmd, _stdout, _stderr, _stdin, _tty, statusCb
+    ) {
+      void Promise.resolve().then(() => statusCb({ status: 'Success', code: 0 }))
+      return Promise.resolve(null)
+    })
+    const code = await execPodStep(['echo', 'hi'], 'my-pod', 'job')
+    expect(code).toBe(0)
+  })
+
+  it('rejects with message on Failure', async () => {
+    execSpy.mockImplementation(async function (
+      this: any,
+      _ns, _pod, _c, _cmd, _stdout, _stderr, _stdin, _tty, statusCb
+    ) {
+      void Promise.resolve().then(() =>
+        statusCb({ status: 'Failure', message: 'command failed' })
+      )
+      return Promise.resolve(null)
+    })
+    await expect(
+      execPodStep(['sh', '-c', 'exit 1'], 'my-pod', 'job')
+    ).rejects.toThrow('command failed')
+  })
+
+  it('rejects when exec promise rejects', async () => {
+    execSpy.mockRejectedValue(new Error('connection refused') as never)
+    await expect(
+      execPodStep(['ls'], 'my-pod', 'job')
+    ).rejects.toThrow('connection refused')
+  })
+
+  it('resolves with Success code when ws is non-null (heartbeat branch)', async () => {
+    const fakeWs = {
+      readyState: 1,
+      once: vi.fn((_event, cb) => { setTimeout(cb, 0); return fakeWs }),
+      close: vi.fn()
+    }
+    execSpy.mockImplementation(async function (
+      this: any,
+      _ns, _pod, _c, _cmd, _stdout, _stderr, _stdin, _tty, statusCb
+    ) {
+      void Promise.resolve().then(() => statusCb({ status: 'Success', code: 42 }))
+      return Promise.resolve(fakeWs)
+    })
+    const code = await execPodStep(['echo'], 'my-pod', 'job')
+    expect(code).toBe(42)
+  })
+
+  it('handles ws close timeout on Failure (readyState=1)', async () => {
+    const fakeWs = {
+      readyState: 1,
+      once: vi.fn(),
+      close: vi.fn()
+    }
+    execSpy.mockImplementation(async function (
+      this: any,
+      _ns, _pod, _c, _cmd, _stdout, _stderr, _stdin, _tty, statusCb
+    ) {
+      void Promise.resolve().then(() =>
+        statusCb({ status: 'Failure', message: 'oops' })
+      )
+      return Promise.resolve(fakeWs)
+    })
+    await expect(
+      execPodStep(['fail'], 'my-pod', 'job')
+    ).rejects.toThrow('oops')
+  }, 10000)
 })
