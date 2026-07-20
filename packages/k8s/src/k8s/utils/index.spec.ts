@@ -421,3 +421,157 @@ describe('formatError', () => {
     expect(formatError('oops')).toBe('oops')
   })
 })
+
+// ── writeRunScript: prependPath variants (lines 69-72) ───────────────────────
+
+describe('writeRunScript prependPath', () => {
+  const originalRunnerTemp = process.env.RUNNER_TEMP
+  beforeEach(() => {
+    process.env.RUNNER_TEMP = makeTempDir()
+  })
+  afterEach(() => {
+    if (originalRunnerTemp) process.env.RUNNER_TEMP = originalRunnerTemp
+    else delete process.env.RUNNER_TEMP
+    vi.restoreAllMocks()
+  })
+
+  it('accepts prependPath as array and joins with ":"', () => {
+    const { runnerPath } = writeRunScript(
+      '/work',
+      'sh',
+      ['script.sh'],
+      ['/usr/local/bin', '/opt/bin'],
+      {}
+    )
+    const content = fs.readFileSync(runnerPath, 'utf8')
+    expect(content).toContain('export PATH=/usr/local/bin:/opt/bin:$PATH')
+    fs.rmSync(runnerPath, { force: true })
+  })
+
+  it('accepts prependPath as string (legacy compat)', () => {
+    const { runnerPath } = writeRunScript(
+      '/work',
+      'sh',
+      ['script.sh'],
+      '/legacy/bin' as any,
+      {}
+    )
+    const content = fs.readFileSync(runnerPath, 'utf8')
+    expect(content).toContain('export PATH=/legacy/bin:$PATH')
+    fs.rmSync(runnerPath, { force: true })
+  })
+})
+
+// ── scriptEnv: empty envs short-circuit (lines 155-156) ─────────────────────
+
+describe('scriptEnv via writeRunScript empty envs', () => {
+  const originalRunnerTemp = process.env.RUNNER_TEMP
+  beforeEach(() => {
+    process.env.RUNNER_TEMP = makeTempDir()
+  })
+  afterEach(() => {
+    if (originalRunnerTemp) process.env.RUNNER_TEMP = originalRunnerTemp
+    else delete process.env.RUNNER_TEMP
+  })
+
+  it('omits env prefix when environmentVariables is empty', () => {
+    const { runnerPath } = writeRunScript({
+      entryPointArgs: ['hello'],
+      environmentVariables: {}
+    } as any)
+    const content = fs.readFileSync(runnerPath, 'utf8')
+    // No "env " prefix when there are no envs
+    expect(content).not.toMatch(/^env\s/m)
+    fs.rmSync(runnerPath, { force: true })
+  })
+})
+
+// ── mergeContainerWithOptions: volumeMounts + ports branches (lines 187-188, 197-198) ──
+
+describe('mergeContainerWithOptions volumeMounts and ports', () => {
+  it('merges volumeMounts when from has volumeMounts', () => {
+    const base = {
+      name: 'job',
+      image: 'ubuntu:latest',
+      volumeMounts: [{ name: 'a', mountPath: '/a' }]
+    }
+    const from = {
+      volumeMounts: [{ name: 'b', mountPath: '/b' }]
+    } as any
+    mergeContainerWithOptions(base, from)
+    expect(base.volumeMounts).toHaveLength(2)
+    expect(base.volumeMounts?.[1].name).toBe('b')
+  })
+
+  it('merges ports when from has ports', () => {
+    const base = {
+      name: 'job',
+      image: 'ubuntu:latest',
+      ports: [{ containerPort: 80 }]
+    }
+    const from = {
+      ports: [{ containerPort: 443 }]
+    } as any
+    mergeContainerWithOptions(base, from)
+    expect(base.ports).toHaveLength(2)
+    expect(base.ports?.[1].containerPort).toBe(443)
+  })
+})
+
+// ── mergeObjectMeta: overwrite warnings (lines 240-241, 249-252) ─────────────
+
+describe('mergeObjectMeta overwrite warnings', () => {
+  it('warns when label already exists and overwrites', () => {
+    const base = {
+      metadata: {
+        labels: { app: 'base' },
+        annotations: {}
+      }
+    } as any
+    const from = { labels: { app: 'overwritten' } } as any
+    mergeObjectMeta(base, from)
+    expect(base.metadata.labels.app).toBe('overwritten')
+  })
+
+  it('warns when annotation already exists and overwrites', () => {
+    const base = {
+      metadata: {
+        labels: {},
+        annotations: { note: 'base' }
+      }
+    } as any
+    const from = { annotations: { note: 'overwritten' } } as any
+    mergeObjectMeta(base, from)
+    expect(base.metadata.annotations.note).toBe('overwritten')
+  })
+})
+
+// ── readExtensionFromFile: invalid YAML (lines 265-266) ─────────────────────
+
+describe('readExtensionFromFile invalid YAML', () => {
+  it('throws when file content is not an object (scalar)', () => {
+    process.env[ENV_HOOK_TEMPLATE_PATH] = '/tmp/nonexistent-scalar.yaml'
+    const tmpDir = makeTempDir()
+    const filePath = path.join(tmpDir, 'scalar.yaml')
+    // A YAML scalar (just a string) — not an object
+    fs.writeFileSync(filePath, 'just a string')
+    process.env[ENV_HOOK_TEMPLATE_PATH] = filePath
+    expect(() => readExtensionFromFile()).toThrow(/Failed to parse/)
+    fs.rmSync(filePath, { force: true })
+  })
+})
+
+// ── mergeLists: undefined from (lines 286-287) ──────────────────────────────
+
+describe('mergeLists via mergeContainerWithOptions empty from', () => {
+  it('returns base list unchanged when from is undefined', () => {
+    const base = {
+      name: 'job',
+      image: 'ubuntu:latest',
+      env: [{ name: 'A', value: '1' }]
+    }
+    const from = { env: undefined } as any
+    mergeContainerWithOptions(base, from)
+    expect(base.env).toEqual([{ name: 'A', value: '1' }])
+  })
+})

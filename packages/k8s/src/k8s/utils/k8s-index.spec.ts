@@ -1,3 +1,4 @@
+import * as fs from 'fs'
 import * as k8s from '@kubernetes/client-node'
 import {
   namespace,
@@ -21,7 +22,18 @@ import {
   PERMANENT_SCHEDULING_PATTERNS,
   deletePod,
   createJobPod,
-  createContainerStepPod
+  createContainerStepPod,
+  createDockerSecret,
+  createSecretForEnvs,
+  deleteSecret,
+  pruneSecrets,
+  prunePods,
+  getPodStatus,
+  waitForJobToComplete,
+  isAuthPermissionsOK,
+  execCalculateOutputHashSorted,
+  localCalculateOutputHashSorted,
+  isPodContainerAlpine
 } from '../index'
 import { PodPhase } from './index'
 
@@ -832,5 +844,656 @@ describe('createContainerStepPod', () => {
     const pod = await createContainerStepPod('step-pod', container)
     expect(createSpy).toHaveBeenCalled()
     expect(pod).toBeDefined()
+  })
+})
+
+// ── namespace (fallbacks) ─────────────────────────────────────────────────────
+//
+// We cannot spy on `fs.readFileSync` directly in ESM (module namespace is not
+// configurable). Instead, use a real temp file path that doesn't exist for
+// the "missing" path, and a real temp file with content for the SA-file path.
+
+describe('namespace fallbacks', () => {
+  afterEach(() => {
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('throws when no namespace source is available', () => {
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+    // ServiceAccount file does not exist on dev/CI machines → throws ENOENT
+    expect(() => namespace()).toThrow(/Failed to determine namespace/)
+  })
+})
+
+// ── getPermanentSchedulingPatterns (env extension + cache) ───────────────────
+
+describe('getPermanentSchedulingPatterns env extension', () => {
+  afterEach(() => {
+    delete process.env['ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS']
+    vi.restoreAllMocks()
+  })
+
+  it('skips invalid regex with a warning', () => {
+    process.env['ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS'] =
+      '[invalid, (goodpattern)'
+    const result = getPermanentSchedulingPatterns()
+    expect(result.length).toBeGreaterThan(PERMANENT_SCHEDULING_PATTERNS.length)
+    // Valid pattern was added, invalid one was skipped
+    expect(result.some(p => p.source.includes('goodpattern'))).toBe(true)
+  })
+
+  it('caches compiled patterns across calls with same env', () => {
+    process.env['ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS'] =
+      'pattern-a'
+    const first = getPermanentSchedulingPatterns()
+    const second = getPermanentSchedulingPatterns()
+    // Same env → cached result, identity preserved
+    expect(second).toBe(first)
+  })
+
+  it('filters out empty entries from comma-separated list', () => {
+    process.env['ACTIONS_RUNNER_K8S_PERMANENT_SCHEDULING_PATTERNS'] =
+      ' ,, alpha, '
+    const result = getPermanentSchedulingPatterns()
+    // Only "alpha" should be added
+    expect(result.some(p => p.source === 'alpha')).toBe(true)
+    expect(result.some(p => p.source === '')).toBe(false)
+  })
+})
+
+// ── createDockerSecret ───────────────────────────────────────────────────────
+
+describe('createDockerSecret', () => {
+  let createSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    process.env['ACTIONS_RUNNER_POD_NAME'] = 'runner-pod'
+    createSpy = vi.spyOn(
+      k8s.CoreV1Api.prototype,
+      'createNamespacedSecret' as any
+    )
+    createSpy.mockResolvedValue({
+      metadata: { name: 'docker-secret' }
+    } as never)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+    delete process.env['ACTIONS_RUNNER_POD_NAME']
+  })
+
+  it('creates secret with base64-encoded docker config', async () => {
+    const secret = await createDockerSecret({
+      serverUrl: 'https://ghcr.io',
+      username: 'user',
+      password: 'pass'
+    })
+    expect(createSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ namespace: 'default' })
+    )
+    expect(secret.metadata?.name).toBe('docker-secret')
+    // Verify the auth payload decodes correctly
+    const call = createSpy.mock.calls[0][0] as any
+    const decoded = JSON.parse(
+      Buffer.from(call.body.data['.dockerconfigjson'], 'base64').toString(
+        'utf8'
+      )
+    )
+    expect(decoded.auths['https://ghcr.io'].username).toBe('user')
+    expect(decoded.auths['https://ghcr.io'].password).toBe('pass')
+  })
+
+  it('falls back to docker.io when serverUrl is missing', async () => {
+    await createDockerSecret({
+      username: 'u',
+      password: 'p'
+    } as any)
+    const call = createSpy.mock.calls[0][0] as any
+    const decoded = JSON.parse(
+      Buffer.from(call.body.data['.dockerconfigjson'], 'base64').toString(
+        'utf8'
+      )
+    )
+    expect(decoded.auths['https://index.docker.io/v1/']).toBeDefined()
+  })
+})
+
+// ── createSecretForEnvs ──────────────────────────────────────────────────────
+
+describe('createSecretForEnvs', () => {
+  let createSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    process.env['ACTIONS_RUNNER_POD_NAME'] = 'runner-pod'
+    createSpy = vi.spyOn(
+      k8s.CoreV1Api.prototype,
+      'createNamespacedSecret' as any
+    )
+    createSpy.mockResolvedValue({ metadata: { name: 'env-secret' } } as never)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+    delete process.env['ACTIONS_RUNNER_POD_NAME']
+  })
+
+  it('base64-encodes each env value', async () => {
+    const name = await createSecretForEnvs({ FOO: 'bar', BAZ: 'qux' })
+    // createSecretForEnvs returns the locally-generated secret name (not the API response)
+    expect(typeof name).toBe('string')
+    expect(name.length).toBeGreaterThan(0)
+    const call = createSpy.mock.calls[0][0] as any
+    expect(call.body.data['FOO']).toBe(Buffer.from('bar').toString('base64'))
+    expect(call.body.data['BAZ']).toBe(Buffer.from('qux').toString('base64'))
+  })
+
+  it('handles empty envs object', async () => {
+    const name = await createSecretForEnvs({})
+    expect(typeof name).toBe('string')
+    expect(name.length).toBeGreaterThan(0)
+    const call = createSpy.mock.calls[0][0] as any
+    expect(call.body.data).toEqual({})
+  })
+})
+
+// ── deleteSecret ─────────────────────────────────────────────────────────────
+
+describe('deleteSecret', () => {
+  let deleteSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    deleteSpy = vi.spyOn(
+      k8s.CoreV1Api.prototype,
+      'deleteNamespacedSecret' as any
+    )
+    deleteSpy.mockResolvedValue({} as never)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('calls deleteNamespacedSecret with name and namespace', async () => {
+    await deleteSecret('my-secret')
+    expect(deleteSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'my-secret', namespace: 'default' })
+    )
+  })
+})
+
+// ── pruneSecrets ─────────────────────────────────────────────────────────────
+
+describe('pruneSecrets', () => {
+  let listSpy: ReturnType<typeof vi.spyOn>
+  let deleteSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    process.env['ACTIONS_RUNNER_POD_NAME'] = 'runner-pod'
+    listSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'listNamespacedSecret' as any)
+    deleteSpy = vi.spyOn(
+      k8s.CoreV1Api.prototype,
+      'deleteNamespacedSecret' as any
+    )
+    deleteSpy.mockResolvedValue({} as never)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+    delete process.env['ACTIONS_RUNNER_POD_NAME']
+  })
+
+  it('returns immediately when no secrets found', async () => {
+    listSpy.mockResolvedValue({ items: [] } as never)
+    await pruneSecrets()
+    expect(deleteSpy).not.toHaveBeenCalled()
+  })
+
+  it('deletes all secrets returned by list', async () => {
+    listSpy.mockResolvedValue({
+      items: [
+        { metadata: { name: 'a' } },
+        { metadata: { name: 'b' } },
+        { metadata: { name: undefined } } // skipped
+      ]
+    } as never)
+    await pruneSecrets()
+    expect(deleteSpy).toHaveBeenCalledTimes(2)
+    expect(deleteSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'a' })
+    )
+    expect(deleteSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'b' })
+    )
+  })
+})
+
+// ── prunePods ────────────────────────────────────────────────────────────────
+
+describe('prunePods', () => {
+  let listSpy: ReturnType<typeof vi.spyOn>
+  let deleteSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    process.env['ACTIONS_RUNNER_POD_NAME'] = 'runner-pod'
+    listSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'listNamespacedPod' as any)
+    deleteSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'deleteNamespacedPod' as any)
+    deleteSpy.mockResolvedValue({} as never)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+    delete process.env['ACTIONS_RUNNER_POD_NAME']
+  })
+
+  it('returns immediately when no pods found', async () => {
+    listSpy.mockResolvedValue({ items: [] } as never)
+    await prunePods()
+    expect(deleteSpy).not.toHaveBeenCalled()
+  })
+
+  it('deletes all named pods', async () => {
+    listSpy.mockResolvedValue({
+      items: [{ metadata: { name: 'p1' } }, { metadata: { name: 'p2' } }]
+    } as never)
+    await prunePods()
+    expect(deleteSpy).toHaveBeenCalledTimes(2)
+  })
+})
+
+// ── getPodStatus ─────────────────────────────────────────────────────────────
+
+describe('getPodStatus', () => {
+  let readSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    readSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'readNamespacedPod' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('returns pod.status from the API', async () => {
+    readSpy.mockResolvedValue({
+      status: { phase: PodPhase.RUNNING }
+    } as never)
+    const status = await getPodStatus('my-pod')
+    expect(status?.phase).toBe(PodPhase.RUNNING)
+  })
+})
+
+// ── waitForJobToComplete ─────────────────────────────────────────────────────
+
+describe('waitForJobToComplete', () => {
+  let readSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    readSpy = vi.spyOn(k8s.BatchV1Api.prototype, 'readNamespacedJob' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('resolves when job has succeeded status', async () => {
+    readSpy.mockResolvedValue({ status: { succeeded: 1 } } as never)
+    await expect(waitForJobToComplete('my-job')).resolves.toBeUndefined()
+  })
+
+  it('throws wrapped error when job has failed status', async () => {
+    readSpy.mockResolvedValue({ status: { failed: 1 } } as never)
+    await expect(waitForJobToComplete('my-job')).rejects.toThrow(
+      /job my-job has failed/
+    )
+  })
+})
+
+// ── isAuthPermissionsOK ──────────────────────────────────────────────────────
+
+describe('isAuthPermissionsOK', () => {
+  let sarSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    sarSpy = vi.spyOn(
+      k8s.AuthorizationV1Api.prototype,
+      'createSelfSubjectAccessReview' as any
+    )
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('returns true when all permissions are allowed', async () => {
+    sarSpy.mockResolvedValue({ status: { allowed: true } } as never)
+    await expect(isAuthPermissionsOK()).resolves.toBe(true)
+  })
+
+  it('returns false when any permission is denied', async () => {
+    sarSpy.mockResolvedValue({ status: { allowed: false } } as never)
+    await expect(isAuthPermissionsOK()).resolves.toBe(false)
+  })
+})
+
+// ── localCalculateOutputHashSorted ───────────────────────────────────────────
+
+describe('localCalculateOutputHashSorted', () => {
+  it('sorts lines and produces a sha256 hash', async () => {
+    // Use `node` so the test is cross-platform (Windows has no /bin/echo)
+    const { hash, lines } = await localCalculateOutputHashSorted([
+      process.execPath,
+      '-e',
+      "console.log('hello')"
+    ])
+    expect(lines).toEqual(['hello'])
+    expect(hash).toMatch(/^[a-f0-9]{64}$/)
+  })
+
+  it('rejects when child process exits non-zero', async () => {
+    // `node -e process.exit(1)` always exits 1 on every platform
+    await expect(
+      localCalculateOutputHashSorted([
+        process.execPath,
+        '-e',
+        'process.exit(1)'
+      ])
+    ).rejects.toThrow(/exited with code/)
+  })
+})
+
+// ── execCalculateOutputHashSorted ────────────────────────────────────────────
+
+describe('execCalculateOutputHashSorted', () => {
+  let execSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    execSpy = vi.spyOn(k8s.Exec.prototype, 'exec' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('sorts captured stdout and returns hash + lines', async () => {
+    // Simulate the exec callback path: capture stream receives bytes,
+    // status callback fires with Success.
+    execSpy.mockImplementation(function (
+      this: any,
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
+    ) {
+      // Write some lines out of order to verify sorting
+      stdout.write('banana\napple\ncherry\n')
+      Promise.resolve().then(() => statusCb({ status: 'Success', code: 0 }))
+      return Promise.resolve({})
+    })
+    const { hash, lines } = await execCalculateOutputHashSorted(
+      'my-pod',
+      'job',
+      ['sh', '-c', 'echo test']
+    )
+    expect(lines).toEqual(['apple', 'banana', 'cherry'])
+    expect(hash).toMatch(/^[a-f0-9]{64}$/)
+  })
+
+  it('rejects when exec returns Failure status', async () => {
+    execSpy.mockImplementation(function (
+      this: any,
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
+    ) {
+      stdout.write('')
+      Promise.resolve().then(() =>
+        statusCb({ status: 'Failure', message: 'exec failed' })
+      )
+      return Promise.resolve({})
+    })
+    await expect(
+      execCalculateOutputHashSorted('my-pod', 'job', ['ls'])
+    ).rejects.toThrow('exec failed')
+  })
+
+  it('rejects when exec promise rejects', async () => {
+    execSpy.mockRejectedValue(new Error('connection refused') as never)
+    await expect(
+      execCalculateOutputHashSorted('my-pod', 'job', ['ls'])
+    ).rejects.toThrow('connection refused')
+  })
+})
+
+// ── isPodContainerAlpine ─────────────────────────────────────────────────────
+
+describe('isPodContainerAlpine', () => {
+  let execSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    execSpy = vi.spyOn(k8s.Exec.prototype, 'exec' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('returns true when the alpine check exits 0', async () => {
+    execSpy.mockImplementation(function (
+      this: any,
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      _stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
+    ) {
+      Promise.resolve().then(() => statusCb({ status: 'Success', code: 0 }))
+      return Promise.resolve({})
+    })
+    await expect(isPodContainerAlpine('my-pod', 'job')).resolves.toBe(true)
+  })
+
+  it('returns false when the alpine check fails (non-zero exit)', async () => {
+    execSpy.mockImplementation(function (
+      this: any,
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      _stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
+    ) {
+      Promise.resolve().then(() =>
+        statusCb({
+          status: 'Failure',
+          message: 'command terminated with exit code 1'
+        })
+      )
+      return Promise.resolve({})
+    })
+    await expect(isPodContainerAlpine('my-pod', 'job')).resolves.toBe(false)
+  })
+})
+
+// ── getPodEventErrors (extended: count + multiple reasons) ───────────────────
+
+describe('getPodEventErrors extended', () => {
+  let eventSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    eventSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'listNamespacedEvent' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('appends (xN) when event count > 1', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([buildEvent('FailedMount', 'mount err', { count: 5 })])
+    )
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors[0]).toContain('(x5)')
+  })
+
+  it('returns errors for distinct unrecoverable reasons', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedMount', 'm1'),
+        buildEvent('FailedBinding', 'pvc not found')
+      ])
+    )
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors).toHaveLength(2)
+    expect(errors.some(e => e.includes('FailedMount'))).toBe(true)
+    expect(errors.some(e => e.includes('FailedBinding'))).toBe(true)
+  })
+
+  it('skips FailedScheduling when message has no permanent pattern', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedScheduling', 'some random transient issue')
+      ])
+    )
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors).toEqual([])
+  })
+
+  it('includes message detail in error', async () => {
+    eventSpy.mockResolvedValue(
+      eventResult([
+        buildEvent('FailedMount', 'a specific mount failure detail')
+      ])
+    )
+    const errors = await getPodEventErrors('my-pod')
+    expect(errors[0]).toContain('a specific mount failure detail')
+  })
+})
+
+// ── createJobPod with extension ───────────────────────────────────────────────
+
+describe('createJobPod with extension and workingDir', () => {
+  let createSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    process.env['ACTIONS_RUNNER_POD_NAME'] = 'runner-pod'
+    process.env['GITHUB_WORKSPACE'] = '/__w/repo/repo'
+    createSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'createNamespacedPod' as any)
+    createSpy.mockResolvedValue({
+      metadata: { name: 'job-pod' },
+      spec: { containers: [] }
+    } as never)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+    delete process.env['ACTIONS_RUNNER_POD_NAME']
+    delete process.env['GITHUB_WORKSPACE']
+  })
+
+  it('applies extension metadata and spec when provided', async () => {
+    // Covers k8s/index.ts lines 229-230, 233 (extension branches in createJobPod)
+    const extension: k8s.V1PodTemplateSpec = {
+      metadata: {
+        labels: { 'custom-label': 'val' },
+        annotations: { 'custom-ann': 'val2' }
+      },
+      spec: {
+        containers: [],
+        restartPolicy: 'Never'
+      }
+    }
+    const container = new k8s.V1Container()
+    container.name = 'job'
+    container.image = 'ubuntu:latest'
+    await createJobPod('job-pod', container, [], undefined, extension)
+    expect(createSpy).toHaveBeenCalled()
+  })
+
+  it('sets workingDirPath mkdir when GITHUB_WORKSPACE has sub-path', async () => {
+    // Covers k8s/index.ts line 117 (workingDirPath conditional)
+    process.env['GITHUB_WORKSPACE'] = '/__w/repo/myrepo'
+    const container = new k8s.V1Container()
+    container.name = 'job'
+    container.image = 'ubuntu:latest'
+    await createJobPod('job-pod', container)
+    expect(createSpy).toHaveBeenCalled()
+  })
+})
+
+// ── getContainerErrors — getWaitingReasonHint branches ────────────────────────
+
+describe('getContainerErrors — getWaitingReasonHint additional branches', () => {
+  it('returns CreateContainerConfigError hint', () => {
+    // Covers k8s/index.ts lines 1127-1128 (CreateContainerConfigError case)
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'CreateContainerConfigError')]
+    })
+    const errors = getContainerErrors(pod)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('Container config is invalid')
+  })
+
+  it('returns default hint for unknown waiting reason via env extension', () => {
+    // Covers k8s/index.ts lines 1136-1139 (default case in getWaitingReasonHint)
+    // Add a custom reason via env var
+    process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_WAITING_REASONS'] =
+      'WeirdCustomReason'
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'WeirdCustomReason')]
+    })
+    const errors = getContainerErrors(pod)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('kubectl describe pod')
+    delete process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_WAITING_REASONS']
+  })
+
+  it('returns InvalidImageName hint', () => {
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'InvalidImageName')]
+    })
+    const errors = getContainerErrors(pod)
+    expect(errors[0]).toContain('malformed')
   })
 })

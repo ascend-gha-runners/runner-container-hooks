@@ -323,4 +323,185 @@ describe('prepareJob', () => {
     const content = JSON.parse(fs.readFileSync(responseFile, 'utf8'))
     expect(content.context.services).toHaveLength(2)
   })
+
+  it('writes service container ports to response file', async () => {
+    const args = makeArgs() as any
+    args.services = [
+      {
+        image: 'redis:latest',
+        portMappings: ['6379:6379'],
+        environmentVariables: {}
+      }
+    ]
+    vi.mocked(k8sMod.createJobPod).mockResolvedValue({
+      metadata: { name: 'job-pod' },
+      spec: {
+        containers: [
+          { name: JOB_CONTAINER_NAME, image: 'ubuntu:latest', ports: [] },
+          {
+            name: 'redis',
+            image: 'redis:latest',
+            ports: [{ containerPort: 6379, hostPort: 6379 }]
+          }
+        ]
+      },
+      status: {}
+    } as k8s.V1Pod)
+    await prepareJob(args, responseFile)
+    const content = JSON.parse(fs.readFileSync(responseFile, 'utf8'))
+    expect(content.context.services).toHaveLength(1)
+    expect(content.context.services[0].ports['6379']).toBe('6379')
+  })
+
+  it('extracts k8s body message with headers section', async () => {
+    // Multi-line message with Headers section present — covers the
+    // raw.lastIndexOf('"', headersIdx) path
+    vi.mocked(k8sMod.createJobPod).mockRejectedValue(
+      new Error(
+        'HTTP-Code: 422\nMessage: Unprocessable\nBody: "{\\"kind\\":\\"Status\\",\\"message\\":\\"spec is invalid\\"}"\nHeaders: {"content-type":"application/json"}'
+      )
+    )
+    await expect(prepareJob(makeArgs() as any, responseFile)).rejects.toThrow(
+      'spec is invalid'
+    )
+  })
+
+  it('falls back to bodyStr when body is non-JSON', async () => {
+    vi.mocked(k8sMod.createJobPod).mockRejectedValue(
+      new Error('HTTP-Code: 502\nBody: "Bad Gateway"\nHeaders: {}')
+    )
+    await expect(prepareJob(makeArgs() as any, responseFile)).rejects.toThrow(
+      'Bad Gateway'
+    )
+  })
+
+  it('runs prepareScript when userMountVolumes are present', async () => {
+    const args = makeArgs() as any
+    args.container.userMountVolumes = [
+      {
+        sourceVolumePath: '/src/vol1',
+        targetVolumePath: '/mnt/vol1',
+        readOnly: false
+      }
+    ]
+    await prepareJob(args, responseFile)
+    // execPodStep and execCpToPod are both called for the prepare script flow
+    expect(k8sMod.execPodStep).toHaveBeenCalled()
+    expect(k8sMod.execCpToPod).toHaveBeenCalledWith(
+      'job-pod',
+      '/src/vol1',
+      '/mnt/vol1'
+    )
+  })
+
+  it('throws when created pod has no metadata.name', async () => {
+    vi.mocked(k8sMod.createJobPod).mockResolvedValue({} as k8s.V1Pod)
+    await expect(prepareJob(makeArgs() as any, responseFile)).rejects.toThrow(
+      'created pod should have metadata.name'
+    )
+  })
+
+  it('uses services fallback when serviceNames is empty', async () => {
+    // When serviceNames is empty but services are present, the response
+    // generator falls back to args.services.map(generateContainerName).
+    const args = makeArgs() as any
+    args.services = [
+      {
+        image: 'redis:latest',
+        portMappings: [],
+        environmentVariables: {}
+      }
+    ]
+    vi.mocked(k8sMod.createJobPod).mockResolvedValue({
+      metadata: { name: 'job-pod' },
+      spec: {
+        containers: [
+          { name: JOB_CONTAINER_NAME, image: 'ubuntu:latest', ports: [] },
+          { name: 'redis', image: 'redis:latest', ports: [] }
+        ]
+      },
+      status: {}
+    } as k8s.V1Pod)
+    await prepareJob(args, responseFile)
+    const content = JSON.parse(fs.readFileSync(responseFile, 'utf8'))
+    expect(content.context.services).toHaveLength(1)
+  })
+
+  it('executes prepareScript and copies userMountVolumes when present', async () => {
+    // Covers prepare-job.ts lines 197-215 (prepareScript branch)
+    const args = makeArgs() as any
+    args.container.userMountVolumes = [
+      {
+        sourceVolumePath: '/src/data',
+        targetVolumePath: '/mnt/data',
+        readOnly: false
+      }
+    ]
+    await prepareJob(args, responseFile)
+    // execPodStep called for prepareScript sh command
+    expect(k8sMod.execPodStep).toHaveBeenCalledWith(
+      expect.arrayContaining(['sh', '-e']),
+      'job-pod',
+      expect.any(String)
+    )
+    // execCpToPod called for the volume copy
+    expect(k8sMod.execCpToPod).toHaveBeenCalledWith(
+      'job-pod',
+      '/src/data',
+      '/mnt/data'
+    )
+  })
+
+  it('deduplicates colliding service image names with -0/-1 suffix', async () => {
+    // Covers prepare-job.ts lines 80-81 (total > 1 branch)
+    const args = makeArgs() as any
+    args.services = [
+      { image: 'redis:latest', portMappings: [], environmentVariables: {} },
+      { image: 'redis:latest', portMappings: [], environmentVariables: {} }
+    ]
+    vi.mocked(k8sMod.createJobPod).mockImplementation(
+      async (_name, _container, services) =>
+        ({
+          metadata: { name: 'job-pod' },
+          spec: {
+            containers: [
+              { name: JOB_CONTAINER_NAME, image: 'ubuntu:latest', ports: [] },
+              ...((services || []) as k8s.V1Container[]).map(s => ({
+                name: s.name,
+                image: s.image,
+                ports: []
+              }))
+            ]
+          },
+          status: {}
+        }) as k8s.V1Pod
+    )
+    await prepareJob(args, responseFile)
+    const content = JSON.parse(fs.readFileSync(responseFile, 'utf8'))
+    expect(content.context.services).toHaveLength(2)
+  })
+
+  it('extracts message from plain-text k8s error body', async () => {
+    // Covers prepare-job.ts lines 141-142: bodyStr is plain text (not JSON)
+    vi.mocked(k8sMod.createJobPod).mockRejectedValue(
+      new Error(
+        'HTTP-Code: 502\nMessage: Bad Gateway\nBody: "upstream timeout"\nHeaders: {}'
+      )
+    )
+    await expect(prepareJob(makeArgs() as any, responseFile)).rejects.toThrow(
+      'failed to create job pod'
+    )
+  })
+
+  it('falls through to raw detail when body JSON has no message field', async () => {
+    // Covers prepare-job.ts line 146: parsed is JSON but has no message field
+    vi.mocked(k8sMod.createJobPod).mockRejectedValue(
+      new Error(
+        'HTTP-Code: 422\nMessage: err\nBody: "{\\"kind\\":\\"Status\\",\\"reason\\":\\"Invalid\\"}"\nHeaders: {}'
+      )
+    )
+    await expect(prepareJob(makeArgs() as any, responseFile)).rejects.toThrow(
+      'failed to create job pod'
+    )
+  })
 })

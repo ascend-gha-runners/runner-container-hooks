@@ -143,11 +143,14 @@ describe('runContainerStep — execution paths', () => {
     process.env.GITHUB_WORKSPACE = '/__w/repo/repo'
     process.env.RUNNER_TEMP = tmpDir
     vi.mocked(k8sMod.createContainerStepPod).mockResolvedValue(makePod())
+    vi.mocked(k8sMod.waitForPodPhases).mockResolvedValue(undefined)
     vi.mocked(k8sMod.execPodStepWithOutput).mockResolvedValue({
       code: 0,
       output: ''
     })
     vi.mocked(k8sMod.getPodByName).mockResolvedValue(makePod())
+    vi.mocked(k8sMod.getContainerTerminatedErrors).mockReturnValue([])
+    vi.mocked(k8sMod.describePodFailure).mockResolvedValue('')
   })
 
   afterEach(() => {
@@ -247,5 +250,94 @@ describe('runContainerStep — execution paths', () => {
     vi.mocked(k8sMod.describePodFailure).mockResolvedValue('pod details')
     await expect(runContainerStep(makeArgs())).rejects.toThrow()
     expect(k8sMod.describePodFailure).toHaveBeenCalledWith('step-pod')
+  })
+
+  it('throws when GITHUB_WORKSPACE has fewer than 2 path segments', async () => {
+    // Covers run-container-step.ts lines 95-96 (invalid github workspace)
+    // split('/').slice(-2) needs exactly 2 parts; 'noSlash' → ['noSlash'] → length 1
+    process.env.GITHUB_WORKSPACE = 'noSlash'
+    await expect(runContainerStep(makeArgs())).rejects.toThrow(
+      /Invalid github workspace directory/
+    )
+    delete process.env.GITHUB_WORKSPACE
+  })
+
+  it('classifies script error with terminated state and completed reason', async () => {
+    // Covers run-container-step.ts line 163 (reason === 'Completed' branch)
+    vi.mocked(k8sMod.execPodStepWithOutput).mockResolvedValue({
+      code: 1,
+      output: ''
+    })
+    vi.mocked(k8sMod.getPodByName).mockResolvedValue(
+      makePod('step-pod', [
+        {
+          name: 'job',
+          state: { terminated: { reason: 'Completed', exitCode: 1 } }
+        } as k8s.V1ContainerStatus
+      ])
+    )
+    await expect(runContainerStep(makeArgs())).rejects.toThrow(
+      'failed to run script step'
+    )
+  })
+
+  it('classifies script error when containerStatuses is missing', async () => {
+    // Covers run-container-step.ts line 168 (state unavailable branch)
+    vi.mocked(k8sMod.execPodStepWithOutput).mockResolvedValue({
+      code: 1,
+      output: ''
+    })
+    vi.mocked(k8sMod.getPodByName).mockResolvedValue(makePod('step-pod', []))
+    await expect(runContainerStep(makeArgs())).rejects.toThrow(
+      'failed to run script step'
+    )
+  })
+
+  it('classifies script error when pod fetch throws', async () => {
+    // Covers run-container-step.ts lines 217-218, 220-223 (catch fallback)
+    vi.mocked(k8sMod.execPodStepWithOutput).mockResolvedValue({
+      code: 1,
+      output: ''
+    })
+    vi.mocked(k8sMod.getPodByName).mockRejectedValue(new Error('pod gone'))
+    await expect(runContainerStep(makeArgs())).rejects.toThrow(
+      'failed to run script step'
+    )
+  })
+
+  it('classifies script error when container is in waiting state', async () => {
+    // Covers run-container-step.ts lines 226-227 (waiting state branch)
+    vi.mocked(k8sMod.execPodStepWithOutput).mockResolvedValue({
+      code: 1,
+      output: ''
+    })
+    vi.mocked(k8sMod.getPodByName).mockResolvedValue(
+      makePod('step-pod', [
+        {
+          name: 'job',
+          state: { waiting: { reason: 'ImagePullBackOff' } }
+        } as k8s.V1ContainerStatus
+      ])
+    )
+    await expect(runContainerStep(makeArgs())).rejects.toThrow(
+      'failed to run script step'
+    )
+  })
+
+  it('includes tail output in classify error when output is present', async () => {
+    // Covers run-container-step.ts lines 230-234 (tailOutput branch)
+    vi.mocked(k8sMod.execPodStepWithOutput).mockResolvedValue({
+      code: 1,
+      output: 'Error: something went wrong\n  at line 42'
+    })
+    vi.mocked(k8sMod.getPodByName).mockResolvedValue(
+      makePod('step-pod', [
+        {
+          name: 'job',
+          state: { terminated: { reason: 'Completed', exitCode: 1 } }
+        } as k8s.V1ContainerStatus
+      ])
+    )
+    await expect(runContainerStep(makeArgs())).rejects.toThrow(/Last output:/)
   })
 })

@@ -144,4 +144,18 @@ describe('runScriptStep', () => {
     await runScriptStep(makeArgs() as any, { jobPod: 'job-pod' })
     expect(k8sMod.execCpFromPod).toHaveBeenCalled()
   })
+
+  // Covers run-script-step.ts line 145: catch block when copying temp dir fails
+  it('warns when copying _runner_file_commands fails', async () => {
+    const core = await import('@actions/core')
+    const warnSpy = vi.spyOn(core, 'warning')
+    vi.mocked(k8sMod.execCpFromPod).mockRejectedValueOnce(
+      new Error('cp failed')
+    )
+    // Should NOT throw — the error is swallowed with a warning
+    await expect(
+      runScriptStep(makeArgs() as any, { jobPod: 'job-pod' })
+    ).resolves.toBeUndefined()
+    expect(warnSpy).toHaveBeenCalledWith('Failed to copy _temp from pod')
+  })
 })
