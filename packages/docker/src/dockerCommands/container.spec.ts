@@ -1,7 +1,3 @@
-import * as fs from 'fs'
-import * as path from 'path'
-import * as os from 'os'
-
 vi.mock('../utils', () => ({
   runDockerCommand: vi.fn().mockResolvedValue('container-id-abc'),
   RunDockerCommandOptions: {}
@@ -17,15 +13,7 @@ vi.mock('@actions/core', () => ({
 import { createContainer } from './container'
 import { runDockerCommand } from '../utils'
 
-function makeTmpDir(): string {
-  const d = path.join(os.tmpdir(), `docker-spec-${Date.now()}`)
-  fs.mkdirSync(d, { recursive: true })
-  return d
-}
-
 describe('createContainer mount volumes', () => {
-  const tmpDir = makeTmpDir()
-
   beforeEach(() => {
     process.env.RUNNER_NAME = 'test-runner'
   })

@@ -104,4 +104,110 @@ describe('WebSocketHeartbeat', () => {
     expect(ws.ping).toHaveBeenCalled()
     hb.stop()
   })
+
+  it('emits pong and arms deadline after first ping', () => {
+    const ws = makeMockWs()
+    const hb = new WebSocketHeartbeat(500, 5000)
+    hb.start(ws as any)
+    // First ping arms the deadline
+    vi.advanceTimersByTime(600)
+    expect(ws.ping).toHaveBeenCalledTimes(1)
+    // Emit pong — should reset pong timeout
+    ws.emit('pong')
+    // Advance past the next ping interval
+    vi.advanceTimersByTime(500)
+    expect(ws.ping).toHaveBeenCalledTimes(2)
+  })
+
+  it('rejects when pong deadline elapses with no pong', () => {
+    const ws = makeMockWs()
+    const hb = new WebSocketHeartbeat(500, 1000)
+    const reject = vi.fn()
+    hb.start(ws as any, reject)
+    // First ping arms the deadline (1000ms)
+    vi.advanceTimersByTime(600)
+    expect(ws.ping).toHaveBeenCalledTimes(1)
+    // Advance past the pong deadline without emitting pong
+    vi.advanceTimersByTime(1100)
+    expect(reject).toHaveBeenCalled()
+    expect(reject.mock.calls[0][0]).toBeInstanceOf(Error)
+    expect(reject.mock.calls[0][0].message).toMatch(/heartbeat timeout/)
+  })
+
+  it('closes websocket when pong deadline elapses', () => {
+    const ws = makeMockWs()
+    const hb = new WebSocketHeartbeat(500, 1000)
+    hb.start(ws as any, () => {})
+    vi.advanceTimersByTime(600) // first ping, arms deadline
+    vi.advanceTimersByTime(1100) // deadline elapses
+    expect(ws.close).toHaveBeenCalled()
+  })
+
+  it('stops heartbeat on websocket error event', () => {
+    const ws = makeMockWs()
+    const hb = new WebSocketHeartbeat(500, 5000)
+    hb.start(ws as any)
+    ws.emit('error', new Error('socket died'))
+    // Advance timers; interval should have been cleared so no more pings
+    vi.advanceTimersByTime(2000)
+    expect(ws.ping).toHaveBeenCalledTimes(0)
+  })
+
+  it('stops heartbeat on websocket close event', () => {
+    const ws = makeMockWs()
+    const hb = new WebSocketHeartbeat(500, 5000)
+    hb.start(ws as any)
+    vi.advanceTimersByTime(600) // first ping
+    ws.emit('close')
+    const pingCountAfterClose = ws.ping.mock.calls.length
+    vi.advanceTimersByTime(2000)
+    expect(ws.ping.mock.calls.length).toBe(pingCountAfterClose)
+  })
+
+  it('skips ping while websocket is in CONNECTING state', () => {
+    const ws = makeMockWs()
+    ws.readyState = 0 // CONNECTING
+    const hb = new WebSocketHeartbeat(500, 5000)
+    hb.start(ws as any)
+    vi.advanceTimersByTime(2000)
+    expect(ws.ping).not.toHaveBeenCalled()
+  })
+
+  it('stops heartbeat when websocket transitions to CLOSING', () => {
+    const ws = makeMockWs()
+    const hb = new WebSocketHeartbeat(500, 5000)
+    hb.start(ws as any)
+    vi.advanceTimersByTime(600) // OPEN → first ping fires
+    ws.readyState = 2 // CLOSING
+    vi.advanceTimersByTime(600) // next tick sees CLOSING → stop
+    const pingsAfterTransition = ws.ping.mock.calls.length
+    vi.advanceTimersByTime(2000)
+    expect(ws.ping.mock.calls.length).toBe(pingsAfterTransition)
+  })
+
+  it('catches errors thrown by ws.ping without crashing', () => {
+    const ws = makeMockWs()
+    ws.ping = vi.fn(() => {
+      throw new Error('ping failed')
+    })
+    const hb = new WebSocketHeartbeat(500, 5000)
+    hb.start(ws as any)
+    vi.advanceTimersByTime(600)
+    // ping threw → heartbeat should stop, no further pings
+    vi.advanceTimersByTime(2000)
+    expect(ws.ping).toHaveBeenCalledTimes(1)
+  })
+
+  it('catches errors thrown by ws.close during pong deadline', () => {
+    const ws = makeMockWs()
+    ws.close = vi.fn(() => {
+      throw new Error('already closing')
+    })
+    const hb = new WebSocketHeartbeat(500, 1000)
+    hb.start(ws as any, () => {})
+    vi.advanceTimersByTime(600) // first ping arms deadline
+    vi.advanceTimersByTime(1100) // deadline elapses → close() throws, swallowed
+    // Test passes if no uncaught exception was thrown
+    expect(ws.close).toHaveBeenCalled()
+  })
 })

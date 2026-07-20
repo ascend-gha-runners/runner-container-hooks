@@ -1,4 +1,3 @@
-import * as fs from 'fs'
 import * as k8s from '@kubernetes/client-node'
 import {
   namespace,
@@ -1235,7 +1234,7 @@ describe('execCalculateOutputHashSorted', () => {
   it('sorts captured stdout and returns hash + lines', async () => {
     // Simulate the exec callback path: capture stream receives bytes,
     // status callback fires with Success.
-    execSpy.mockImplementation(function (
+    execSpy.mockImplementation(async function (
       this: any,
       _ns,
       _pod,
@@ -1249,7 +1248,9 @@ describe('execCalculateOutputHashSorted', () => {
     ) {
       // Write some lines out of order to verify sorting
       stdout.write('banana\napple\ncherry\n')
-      Promise.resolve().then(() => statusCb({ status: 'Success', code: 0 }))
+      void Promise.resolve().then(() =>
+        statusCb({ status: 'Success', code: 0 })
+      )
       return Promise.resolve({})
     })
     const { hash, lines } = await execCalculateOutputHashSorted(
@@ -1262,7 +1263,7 @@ describe('execCalculateOutputHashSorted', () => {
   })
 
   it('rejects when exec returns Failure status', async () => {
-    execSpy.mockImplementation(function (
+    execSpy.mockImplementation(async function (
       this: any,
       _ns,
       _pod,
@@ -1275,7 +1276,7 @@ describe('execCalculateOutputHashSorted', () => {
       statusCb
     ) {
       stdout.write('')
-      Promise.resolve().then(() =>
+      void Promise.resolve().then(() =>
         statusCb({ status: 'Failure', message: 'exec failed' })
       )
       return Promise.resolve({})
@@ -1309,7 +1310,7 @@ describe('isPodContainerAlpine', () => {
   })
 
   it('returns true when the alpine check exits 0', async () => {
-    execSpy.mockImplementation(function (
+    execSpy.mockImplementation(async function (
       this: any,
       _ns,
       _pod,
@@ -1321,14 +1322,16 @@ describe('isPodContainerAlpine', () => {
       _tty,
       statusCb
     ) {
-      Promise.resolve().then(() => statusCb({ status: 'Success', code: 0 }))
+      void Promise.resolve().then(() =>
+        statusCb({ status: 'Success', code: 0 })
+      )
       return Promise.resolve({})
     })
     await expect(isPodContainerAlpine('my-pod', 'job')).resolves.toBe(true)
   })
 
   it('returns false when the alpine check fails (non-zero exit)', async () => {
-    execSpy.mockImplementation(function (
+    execSpy.mockImplementation(async function (
       this: any,
       _ns,
       _pod,
@@ -1340,7 +1343,7 @@ describe('isPodContainerAlpine', () => {
       _tty,
       statusCb
     ) {
-      Promise.resolve().then(() =>
+      void Promise.resolve().then(() =>
         statusCb({
           status: 'Failure',
           message: 'command terminated with exit code 1'
