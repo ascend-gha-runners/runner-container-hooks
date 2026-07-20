@@ -1,6 +1,12 @@
 import { defineConfig } from 'vitest/config'
+import path from 'path'
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      hooklib: path.resolve(__dirname, './packages/hooklib/src/index.ts')
+    }
+  },
   test: {
     environment: 'node',
     globals: true,
