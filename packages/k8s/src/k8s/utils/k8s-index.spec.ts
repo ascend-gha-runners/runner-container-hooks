@@ -1553,15 +1553,15 @@ describe('containerPorts', () => {
   })
 
   it('throws on invalid port number', () => {
-    expect(() =>
-      containerPorts({ portMappings: ['0'] } as any)
-    ).toThrow('invalid container port')
-    expect(() =>
-      containerPorts({ portMappings: ['65536'] } as any)
-    ).toThrow('invalid container port')
-    expect(() =>
-      containerPorts({ portMappings: ['abc'] } as any)
-    ).toThrow('invalid container port')
+    expect(() => containerPorts({ portMappings: ['0'] } as any)).toThrow(
+      'invalid container port'
+    )
+    expect(() => containerPorts({ portMappings: ['65536'] } as any)).toThrow(
+      'invalid container port'
+    )
+    expect(() => containerPorts({ portMappings: ['abc'] } as any)).toThrow(
+      'invalid container port'
+    )
   })
 
   it('parses multiple port mappings', () => {
@@ -1705,24 +1705,20 @@ describe('getPodLogs', () => {
   })
 
   it('resolves when log stream ends normally', async () => {
-    logSpy.mockImplementation(
-      async (_ns, _pod, _c, logStream, _opts) => {
-        void Promise.resolve().then(() => logStream.end())
-        return undefined
-      }
-    )
+    logSpy.mockImplementation(async (_ns, _pod, _c, logStream, _opts) => {
+      void Promise.resolve().then(() => logStream.end())
+      return undefined
+    })
     await expect(getPodLogs('my-pod', 'job')).resolves.toBeUndefined()
   })
 
   it('rejects when log stream emits an error', async () => {
-    logSpy.mockImplementation(
-      async (_ns, _pod, _c, logStream, _opts) => {
-        void Promise.resolve().then(() =>
-          logStream.destroy(new Error('stream error'))
-        )
-        return undefined
-      }
-    )
+    logSpy.mockImplementation(async (_ns, _pod, _c, logStream, _opts) => {
+      void Promise.resolve().then(() =>
+        logStream.destroy(new Error('stream error'))
+      )
+      return undefined
+    })
     await expect(getPodLogs('my-pod', 'job')).rejects.toThrow('stream error')
   })
 })
@@ -1776,9 +1772,19 @@ describe('execPodStep', () => {
   it('resolves with exit code 0 on Success', async () => {
     execSpy.mockImplementation(async function (
       this: any,
-      _ns, _pod, _c, _cmd, _stdout, _stderr, _stdin, _tty, statusCb
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      _stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
     ) {
-      void Promise.resolve().then(() => statusCb({ status: 'Success', code: 0 }))
+      void Promise.resolve().then(() =>
+        statusCb({ status: 'Success', code: 0 })
+      )
       return Promise.resolve(null)
     })
     const code = await execPodStep(['echo', 'hi'], 'my-pod', 'job')
@@ -1788,7 +1794,15 @@ describe('execPodStep', () => {
   it('rejects with message on Failure', async () => {
     execSpy.mockImplementation(async function (
       this: any,
-      _ns, _pod, _c, _cmd, _stdout, _stderr, _stdin, _tty, statusCb
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      _stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
     ) {
       void Promise.resolve().then(() =>
         statusCb({ status: 'Failure', message: 'command failed' })
@@ -1802,22 +1816,35 @@ describe('execPodStep', () => {
 
   it('rejects when exec promise rejects', async () => {
     execSpy.mockRejectedValue(new Error('connection refused') as never)
-    await expect(
-      execPodStep(['ls'], 'my-pod', 'job')
-    ).rejects.toThrow('connection refused')
+    await expect(execPodStep(['ls'], 'my-pod', 'job')).rejects.toThrow(
+      'connection refused'
+    )
   })
 
   it('resolves with Success code when ws is non-null (heartbeat branch)', async () => {
     const fakeWs = {
       readyState: 1,
-      once: vi.fn((_event, cb) => { setTimeout(cb, 0); return fakeWs }),
+      once: vi.fn((_event, cb) => {
+        setTimeout(cb, 0)
+        return fakeWs
+      }),
       close: vi.fn()
     }
     execSpy.mockImplementation(async function (
       this: any,
-      _ns, _pod, _c, _cmd, _stdout, _stderr, _stdin, _tty, statusCb
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      _stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
     ) {
-      void Promise.resolve().then(() => statusCb({ status: 'Success', code: 42 }))
+      void Promise.resolve().then(() =>
+        statusCb({ status: 'Success', code: 42 })
+      )
       return Promise.resolve(fakeWs)
     })
     const code = await execPodStep(['echo'], 'my-pod', 'job')
@@ -1832,15 +1859,21 @@ describe('execPodStep', () => {
     }
     execSpy.mockImplementation(async function (
       this: any,
-      _ns, _pod, _c, _cmd, _stdout, _stderr, _stdin, _tty, statusCb
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      _stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
     ) {
       void Promise.resolve().then(() =>
         statusCb({ status: 'Failure', message: 'oops' })
       )
       return Promise.resolve(fakeWs)
     })
-    await expect(
-      execPodStep(['fail'], 'my-pod', 'job')
-    ).rejects.toThrow('oops')
+    await expect(execPodStep(['fail'], 'my-pod', 'job')).rejects.toThrow('oops')
   }, 10000)
 })
