@@ -68,7 +68,7 @@ describe('Run container step', () => {
     runContainerStepData.args.entryPoint = 'bash'
     runContainerStepData.args.entryPointArgs = [
       '-c',
-      "'if [[ -z $NODE_ENV ]]; then exit 1; fi'"
+      'if [[ -z $NODE_ENV ]]; then exit 1; fi'
     ]
     await expect(
       runContainerStep(runContainerStepData.args)
@@ -79,7 +79,7 @@ describe('Run container step', () => {
     runContainerStepData.args.entryPoint = 'bash'
     runContainerStepData.args.entryPointArgs = [
       '-c',
-      "'if [[ -z $GITHUB_ACTIONS  ]] || [[ -z $CI ]]; then exit 1; fi'"
+      'if [[ -z $GITHUB_ACTIONS  ]] || [[ -z $CI ]]; then exit 1; fi'
     ]
     await expect(
       runContainerStep(runContainerStepData.args)
