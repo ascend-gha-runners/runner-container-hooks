@@ -3,9 +3,15 @@
     "compilerOptions": {
       "baseUrl": "./",
       "outDir": "./lib",
-      "rootDir": "./src"
+      "rootDir": "./src",
+      "skipLibCheck": true,
+      "types": []
     },
+    "esModuleInterop": true,
     "include": [
-      "./src"
+      "src/**/*"
+    ],
+    "exclude": [
+      "src/**/*.spec.ts"
     ]
-  }
+}

@@ -3,15 +3,9 @@ import * as path from 'path'
 import { cleanupJob } from '../src/hooks'
 import { createContainerSpec, prepareJob } from '../src/hooks/prepare-job'
 import { TestHelper } from './test-setup'
-import {
-  ENV_HOOK_TEMPLATE_PATH,
-  ENV_USE_KUBE_SCHEDULER,
-  generateContainerName,
-  readExtensionFromFile
-} from '../src/k8s/utils'
-import { getPodByName } from '../src/k8s'
+import { ENV_HOOK_TEMPLATE_PATH, generateContainerName } from '../src/k8s/utils'
+import { execPodStep, getPodByName } from '../src/k8s'
 import { V1Container } from '@kubernetes/client-node'
-import * as yaml from 'js-yaml'
 import { JOB_CONTAINER_NAME } from '../src/hooks/constants'
 
 jest.useRealTimers()
@@ -47,19 +41,34 @@ describe('Prepare job', () => {
   })
 
   it('should prepare job with absolute path for userVolumeMount', async () => {
+    const userVolumeMount = path.join(
+      process.env.GITHUB_WORKSPACE as string,
+      'myvolume'
+    )
+    fs.mkdirSync(userVolumeMount, { recursive: true })
+    fs.writeFileSync(path.join(userVolumeMount, 'file.txt'), 'hello')
     prepareJobData.args.container.userMountVolumes = [
       {
-        sourceVolumePath: path.join(
-          process.env.GITHUB_WORKSPACE as string,
-          '/myvolume'
-        ),
-        targetVolumePath: '/volume_mount',
+        sourceVolumePath: userVolumeMount,
+        targetVolumePath: '/__w/myvolume',
         readOnly: false
       }
     ]
     await expect(
       prepareJob(prepareJobData.args, prepareJobOutputFilePath)
     ).resolves.not.toThrow()
+
+    const content = JSON.parse(
+      fs.readFileSync(prepareJobOutputFilePath).toString()
+    )
+
+    await execPodStep(
+      ['sh', '-c', '[ "$(cat /__w/myvolume/file.txt)" = "hello" ] || exit 5'],
+      content!.state!.jobPod,
+      JOB_CONTAINER_NAME
+    ).then(output => {
+      expect(output).toBe(0)
+    })
   })
 
   it('should prepare job with envs CI and GITHUB_ACTIONS', async () => {
@@ -110,19 +119,6 @@ describe('Prepare job', () => {
     )
   })
 
-  it('should throw an exception if the user volume mount is absolute path outside of GITHUB_WORKSPACE', async () => {
-    prepareJobData.args.container.userMountVolumes = [
-      {
-        sourceVolumePath: '/somewhere/not/in/gh-workspace',
-        targetVolumePath: '/containermount',
-        readOnly: false
-      }
-    ]
-    await expect(
-      prepareJob(prepareJobData.args, prepareJobOutputFilePath)
-    ).rejects.toThrow()
-  })
-
   it('should not run prepare job without the job container', async () => {
     prepareJobData.args.container = undefined
     await expect(
@@ -168,8 +164,7 @@ describe('Prepare job', () => {
 
     expect(got.metadata?.annotations?.['annotated-by']).toBe('extension')
     expect(got.metadata?.labels?.['labeled-by']).toBe('extension')
-    expect(got.spec?.securityContext?.runAsUser).toBe(1000)
-    expect(got.spec?.securityContext?.runAsGroup).toBe(3000)
+    expect(got.spec?.restartPolicy).toBe('Never')
 
     // job container
     expect(got.spec?.containers[0].name).toBe(JOB_CONTAINER_NAME)
@@ -219,17 +214,6 @@ describe('Prepare job', () => {
     expect(content.context.services.length).toBe(1)
   })
 
-  it('should not throw exception using kube scheduler', async () => {
-    // only for ReadWriteMany volumes or single node cluster
-    process.env[ENV_USE_KUBE_SCHEDULER] = 'true'
-
-    await expect(
-      prepareJob(prepareJobData.args, prepareJobOutputFilePath)
-    ).resolves.not.toThrow()
-
-    delete process.env[ENV_USE_KUBE_SCHEDULER]
-  })
-
   test.each([undefined, null, []])(
     'should not throw exception when portMapping=%p',
     async pm => {
@@ -243,4 +227,53 @@ describe('Prepare job', () => {
       expect(() => content.context.services[0].image).not.toThrow()
     }
   )
+
+  it('should prepare job with container with non-root user', async () => {
+    prepareJobData.args!.container!.image =
+      'ghcr.io/actions/actions-runner:latest' // known to use user 1001
+    await expect(
+      prepareJob(prepareJobData.args, prepareJobOutputFilePath)
+    ).resolves.not.toThrow()
+
+    const content = JSON.parse(
+      fs.readFileSync(prepareJobOutputFilePath).toString()
+    )
+    expect(content.state.jobPod).toBeTruthy()
+    expect(content.context.container.image).toBe(
+      'ghcr.io/actions/actions-runner:latest'
+    )
+  })
+
+  it('should create unique service container names when images collide', async () => {
+    // Use fixed, non-colliding high ports. (Kubernetes hostPort must be unique per node.)
+    prepareJobData.args.container.portMappings = ['31080:8080']
+
+    // make two services with the same image
+    const svc = JSON.parse(JSON.stringify(prepareJobData.args.services[0]))
+    const svc2 = JSON.parse(JSON.stringify(svc))
+    // Ensure unique host ports so the pod spec is valid even with two services.
+    // (Kubernetes hostPort must be unique per node.)
+    svc.portMappings = ['31081:80', '31082:8080']
+    svc2.portMappings = ['31083:80', '31084:8080']
+    prepareJobData.args.services = [svc, svc2]
+    // ensure registries are null as TestHelper expects
+    prepareJobData.args.services.forEach((s: any) => (s.registry = null))
+
+    await expect(
+      prepareJob(prepareJobData.args, prepareJobOutputFilePath)
+    ).resolves.not.toThrow()
+
+    const content = JSON.parse(
+      fs.readFileSync(prepareJobOutputFilePath).toString()
+    )
+
+    expect(content.context.services).toBeTruthy()
+    expect(content.context.services.length).toBe(2)
+
+    const got = await getPodByName(content.state.jobPod)
+    const names = (got.spec?.containers || []).map(c => c.name)
+
+    // when images collide, names should be suffixed with -0, -1
+    expect(names).toEqual(expect.arrayContaining(['redis-0', 'redis-1']))
+  })
 })

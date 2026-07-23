@@ -6,6 +6,7 @@ import {
   runScriptStep
 } from '../src/hooks'
 import { TestHelper } from './test-setup'
+import { RunContainerStepArgs, RunScriptStepArgs } from 'hooklib'
 
 jest.useRealTimers()
 
@@ -25,6 +26,7 @@ describe('e2e', () => {
   afterEach(async () => {
     await testHelper.cleanup()
   })
+
   it('should prepare job, run script step, run container step then cleanup without errors', async () => {
     await expect(
       prepareJob(prepareJobData.args, prepareJobOutputFilePath)
@@ -36,13 +38,16 @@ describe('e2e', () => {
     const prepareJobOutputData = JSON.parse(prepareJobOutputJson.toString())
 
     await expect(
-      runScriptStep(scriptStepData.args, prepareJobOutputData.state, null)
+      runScriptStep(
+        scriptStepData.args as RunScriptStepArgs,
+        prepareJobOutputData.state
+      )
     ).resolves.not.toThrow()
 
     const runContainerStepData = testHelper.getRunContainerStepDefinition()
 
     await expect(
-      runContainerStep(runContainerStepData.args)
+      runContainerStep(runContainerStepData.args as RunContainerStepArgs)
     ).resolves.not.toThrow()
 
     await expect(cleanupJob()).resolves.not.toThrow()

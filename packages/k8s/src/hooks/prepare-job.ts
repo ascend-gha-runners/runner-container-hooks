@@ -1,32 +1,40 @@
 import * as core from '@actions/core'
-import * as io from '@actions/io'
 import * as k8s from '@kubernetes/client-node'
 import {
   JobContainerInfo,
   ContextPorts,
   PrepareJobArgs,
-  writeToResponseFile
+  writeToResponseFile,
+  ServiceContainerInfo
 } from 'hooklib'
-import path from 'path'
 import {
   containerPorts,
-  createPod,
+  createJobPod,
   isPodContainerAlpine,
   prunePods,
   waitForPodPhases,
-  getPrepareJobTimeoutSeconds
+  getPrepareJobTimeoutSeconds,
+  execCpToPod,
+  execPodStep
 } from '../k8s'
 import {
-  containerVolumes,
+  CONTAINER_VOLUMES,
   DEFAULT_CONTAINER_ENTRY_POINT,
   DEFAULT_CONTAINER_ENTRY_POINT_ARGS,
+  formatError,
   generateContainerName,
   mergeContainerWithOptions,
   readExtensionFromFile,
   PodPhase,
-  fixArgs
+  fixArgs,
+  prepareJobScript
 } from '../k8s/utils'
-import { CONTAINER_EXTENSION_PREFIX, JOB_CONTAINER_NAME } from './constants'
+import {
+  CONTAINER_EXTENSION_PREFIX,
+  getJobPodName,
+  JOB_CONTAINER_NAME
+} from './constants'
+import { dirname } from 'path'
 
 export async function prepareJob(
   args: PrepareJobArgs,
@@ -39,11 +47,9 @@ export async function prepareJob(
   await prunePods()
 
   const extension = readExtensionFromFile()
-  await copyExternalsToRoot()
 
   let container: k8s.V1Container | undefined = undefined
   if (args.container?.image) {
-    core.debug(`Using image '${args.container.image}' for job image`)
     container = createContainerSpec(
       args.container,
       JOB_CONTAINER_NAME,
@@ -53,15 +59,30 @@ export async function prepareJob(
   }
 
   let services: k8s.V1Container[] = []
+  let serviceNames: string[] = []
   if (args.services?.length) {
+    const occurrences = new Map<string, number>()
+    for (const s of args.services) {
+      const base = generateContainerName(s.image)
+      occurrences.set(base, (occurrences.get(base) || 0) + 1)
+    }
+
+    const indices = new Map<string, number>()
     services = args.services.map(service => {
-      core.debug(`Adding service '${service.image}' to pod definition`)
-      return createContainerSpec(
-        service,
-        generateContainerName(service.image),
-        false,
-        extension
-      )
+      const base = generateContainerName(service.image)
+      const total = occurrences.get(base) || 0
+      const idx = indices.get(base) || 0
+
+      let name: string
+      if (total > 1) {
+        name = `${base}-${idx}`
+      } else {
+        name = base
+      }
+
+      indices.set(base, idx + 1)
+      serviceNames.push(name)
+      return createContainerSpec(service, name, false, extension)
     })
   }
 
@@ -71,7 +92,8 @@ export async function prepareJob(
 
   let createdPod: k8s.V1Pod | undefined = undefined
   try {
-    createdPod = await createPod(
+    createdPod = await createJobPod(
+      getJobPodName(),
       container,
       services,
       args.container.registry,
@@ -80,8 +102,59 @@ export async function prepareJob(
   } catch (err) {
     await prunePods()
     core.debug(`createPod failed: ${JSON.stringify(err)}`)
-    const message = (err as any)?.response?.body?.message || err
-    throw new Error(`failed to create job pod: ${message}`)
+    // The k8s client throws HttpException whose message is a multi-line string
+    // containing the raw HTTP dump. Extract the human-readable "message" field
+    // from the embedded JSON body so the log shows something like:
+    //   failed to create job pod:
+    //     spec.volumes[5].name: Duplicate value: "bad-hostpath"
+    // instead of the full HTTP dump.
+    const raw = err instanceof Error ? err.message : String(err)
+    let detail = raw
+    // The k8s HttpException message is a multi-line dump:
+    //   HTTP-Code: 422
+    //   Message: Unknown API Status Code!
+    //   Body: "{\"kind\":\"Status\",\"message\":\"...\\n\"}"
+    //   Headers: {...}
+    // Extract the Body JSON string, unescape it, and pull out "message".
+    try {
+      const bodyStart = raw.indexOf('Body: "')
+      // The boundary may be '"\nHeaders:' (real newline) or the literal
+      // string ends before Headers — use the last '"' before 'Headers:' as fallback
+      const headersIdx = raw.indexOf('Headers:')
+      const bodyEnd =
+        headersIdx !== -1
+          ? raw.lastIndexOf('"', headersIdx) // last " before Headers:
+          : raw.indexOf('"\nHeaders:')
+      if (bodyStart !== -1 && bodyEnd !== -1 && bodyEnd > bodyStart) {
+        // Body content is a JSON string literal (without surrounding quotes).
+        // Wrap it in quotes and JSON.parse to properly unescape \" \\ \n \t etc.
+        const escaped = raw.substring(bodyStart + 7, bodyEnd)
+        const bodyStr = JSON.parse('"' + escaped + '"')
+        // bodyStr may be plain text (e.g. 502 Bad Gateway) instead of JSON.
+        // Parse separately so a non-JSON body still yields a friendly message.
+        try {
+          const parsed = JSON.parse(bodyStr)
+          if (typeof parsed?.message === 'string') {
+            detail = parsed.message
+          }
+        } catch {
+          detail = bodyStr
+        }
+      }
+    } catch {
+      // Parsing failed — fall through and show the raw string
+    }
+    const errorMessage = [
+      'failed to create job pod:',
+      `  ✗ ${detail}`,
+      '-'.repeat(60),
+      '  → Pod spec was rejected by the k8s API. Check:',
+      '    - resources.requests does not exceed resources.limits',
+      '    - volumeMounts reference a volume defined in spec.volumes',
+      '    - envFrom / valueFrom reference existing Secrets / ConfigMaps',
+      '    - Field types match the k8s schema (kubectl explain pod.spec.containers)'
+    ].join('\n')
+    throw new Error(errorMessage)
   }
 
   if (!createdPod?.metadata?.name) {
@@ -90,6 +163,17 @@ export async function prepareJob(
   core.debug(
     `Job pod created, waiting for it to come online ${createdPod?.metadata?.name}`
   )
+
+  const runnerWorkspaceEnv = process.env.RUNNER_WORKSPACE
+  if (!runnerWorkspaceEnv) {
+    throw new Error('RUNNER_WORKSPACE environment variable is not set')
+  }
+  const runnerWorkspace = dirname(runnerWorkspaceEnv)
+
+  let prepareScript: { containerPath: string; runnerPath: string } | undefined
+  if (args.container?.userMountVolumes?.length) {
+    prepareScript = prepareJobScript(args.container.userMountVolumes || [])
+  }
 
   try {
     await waitForPodPhases(
@@ -100,7 +184,33 @@ export async function prepareJob(
     )
   } catch (err) {
     await prunePods()
-    throw new Error(`pod failed to come online with error: ${err}`)
+    // Unwrap nested "Error: " prefix so the message renders as:
+    //   pod failed to come online:
+    //   <detail from waitForPodPhases, already formatted with sections>
+    const detail = err instanceof Error ? err.message : String(err)
+    throw new Error(`pod failed to come online:\n${detail}`)
+  }
+
+  await execCpToPod(createdPod.metadata.name, runnerWorkspace, '/__w')
+
+  if (prepareScript) {
+    await execPodStep(
+      ['sh', '-e', prepareScript.containerPath],
+      createdPod.metadata.name,
+      JOB_CONTAINER_NAME
+    )
+
+    const promises: Promise<void>[] = []
+    for (const vol of args?.container?.userMountVolumes || []) {
+      promises.push(
+        execCpToPod(
+          createdPod.metadata.name,
+          vol.sourceVolumePath,
+          vol.targetVolumePath
+        )
+      )
+    }
+    await Promise.all(promises)
   }
 
   core.debug('Job pod is ready for traffic')
@@ -112,21 +222,20 @@ export async function prepareJob(
       JOB_CONTAINER_NAME
     )
   } catch (err) {
-    core.debug(
-      `Failed to determine if the pod is alpine: ${JSON.stringify(err)}`
-    )
-    const message = (err as any)?.response?.body?.message || err
+    const message = formatError(err)
+    core.debug(`Failed to determine if the pod is alpine: ${message}`)
     throw new Error(`failed to determine if the pod is alpine: ${message}`)
   }
   core.debug(`Setting isAlpine to ${isAlpine}`)
-  generateResponseFile(responseFile, args, createdPod, isAlpine)
+  generateResponseFile(responseFile, args, createdPod, isAlpine, serviceNames)
 }
 
 function generateResponseFile(
   responseFile: string,
   args: PrepareJobArgs,
   appPod: k8s.V1Pod,
-  isAlpine
+  isAlpine: boolean,
+  serviceNames?: string[]
 ): void {
   if (!appPod.metadata?.name) {
     throw new Error('app pod must have metadata.name specified')
@@ -159,7 +268,9 @@ function generateResponseFile(
 
   if (args.services?.length) {
     const serviceContainerNames =
-      args.services?.map(s => generateContainerName(s.image)) || []
+      serviceNames && serviceNames.length
+        ? serviceNames
+        : args.services?.map(s => generateContainerName(s.image)) || []
 
     response.context['services'] = appPod?.spec?.containers
       ?.filter(c => serviceContainerNames.includes(c.name))
@@ -167,7 +278,9 @@ function generateResponseFile(
         const ctxPorts: ContextPorts = {}
         if (c.ports?.length) {
           for (const port of c.ports) {
-            ctxPorts[port.containerPort] = port.hostPort
+            if (port.containerPort && port.hostPort) {
+              ctxPorts[port.containerPort.toString()] = port.hostPort.toString()
+            }
           }
         }
 
@@ -181,19 +294,8 @@ function generateResponseFile(
   writeToResponseFile(responseFile, JSON.stringify(response))
 }
 
-async function copyExternalsToRoot(): Promise<void> {
-  const workspace = process.env['RUNNER_WORKSPACE']
-  if (workspace) {
-    await io.cp(
-      path.join(workspace, '../../externals'),
-      path.join(workspace, '../externals'),
-      { force: true, recursive: true, copySourceDirectory: false }
-    )
-  }
-}
-
 export function createContainerSpec(
-  container: JobContainerInfo,
+  container: JobContainerInfo | ServiceContainerInfo,
   name: string,
   jobContainer = false,
   extension?: k8s.V1PodTemplateSpec
@@ -208,24 +310,24 @@ export function createContainerSpec(
     image: container.image,
     ports: containerPorts(container)
   } as k8s.V1Container
-  if (container.workingDirectory) {
-    podContainer.workingDir = container.workingDirectory
+  if (container['workingDirectory']) {
+    podContainer.workingDir = container['workingDirectory']
   }
 
   if (container.entryPoint) {
     podContainer.command = [container.entryPoint]
   }
 
-  if (container.entryPointArgs?.length > 0) {
+  if (container.entryPointArgs && container.entryPointArgs.length > 0) {
     podContainer.args = fixArgs(container.entryPointArgs)
   }
 
   podContainer.env = []
   for (const [key, value] of Object.entries(
-    container['environmentVariables']
+    container['environmentVariables'] || {}
   )) {
     if (value && key !== 'HOME') {
-      podContainer.env.push({ name: key, value: value as string })
+      podContainer.env.push({ name: key, value })
     }
   }
 
@@ -234,17 +336,14 @@ export function createContainerSpec(
     value: 'true'
   })
 
-  if (!('CI' in container['environmentVariables'])) {
+  if (!('CI' in (container['environmentVariables'] || {}))) {
     podContainer.env.push({
       name: 'CI',
       value: 'true'
     })
   }
 
-  podContainer.volumeMounts = containerVolumes(
-    container.userMountVolumes,
-    jobContainer
-  )
+  podContainer.volumeMounts = CONTAINER_VOLUMES
 
   if (!extension) {
     return podContainer
