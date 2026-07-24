@@ -1705,7 +1705,7 @@ describe('getPodLogs', () => {
   })
 
   it('resolves when log stream ends normally', async () => {
-    logSpy.mockImplementation(async (_ns, _pod, _c, logStream, _opts) => {
+    logSpy.mockImplementation(async (_ns, _pod, _c, logStream) => {
       void Promise.resolve().then(() => logStream.end())
       return undefined
     })
@@ -1713,7 +1713,7 @@ describe('getPodLogs', () => {
   })
 
   it('rejects when log stream emits an error', async () => {
-    logSpy.mockImplementation(async (_ns, _pod, _c, logStream, _opts) => {
+    logSpy.mockImplementation(async (_ns, _pod, _c, logStream) => {
       void Promise.resolve().then(() =>
         logStream.destroy(new Error('stream error'))
       )

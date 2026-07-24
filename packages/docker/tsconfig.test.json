@@ -3,5 +3,9 @@
     "allowJs": true,
     "types": ["node", "jest"]
   },
-  "extends": "./tsconfig.json"
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/**/*",
+    "tests/**/*"
+  ]
 }
