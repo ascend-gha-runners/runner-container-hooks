@@ -24,7 +24,17 @@ describe('execPodStepWithOutput', () => {
 
   it('resolves with code 0 and captured stdout on success', async () => {
     execSpy.mockImplementation(
-      (_ns, _pod, _container, _cmd, stdout, _stderr, _stdin, _tty, callback) => {
+      (
+        _ns,
+        _pod,
+        _container,
+        _cmd,
+        stdout,
+        _stderr,
+        _stdin,
+        _tty,
+        callback
+      ) => {
         stdout.write('hello from script\n')
         stdout.write('second line\n')
         callback({ status: 'Success', code: 0 })
@@ -62,7 +72,17 @@ describe('execPodStepWithOutput', () => {
 
   it('resolves with exit code from Failure status callback', async () => {
     execSpy.mockImplementation(
-      (_ns, _pod, _container, _cmd, _stdout, stderr, _stdin, _tty, callback) => {
+      (
+        _ns,
+        _pod,
+        _container,
+        _cmd,
+        _stdout,
+        stderr,
+        _stdin,
+        _tty,
+        callback
+      ) => {
         stderr.write('error output\n')
         callback({
           status: 'Failure',
@@ -91,7 +111,17 @@ describe('execPodStepWithOutput', () => {
 
   it('rejects on Failure callback with no exit code in message', async () => {
     execSpy.mockImplementation(
-      (_ns, _pod, _container, _cmd, _stdout, _stderr, _stdin, _tty, callback) => {
+      (
+        _ns,
+        _pod,
+        _container,
+        _cmd,
+        _stdout,
+        _stderr,
+        _stdin,
+        _tty,
+        callback
+      ) => {
         callback({ status: 'Failure', message: 'container not found' })
         return Promise.resolve()
       }
@@ -103,7 +133,17 @@ describe('execPodStepWithOutput', () => {
 
   it('retains only the last tailLines lines in the output buffer', async () => {
     execSpy.mockImplementation(
-      (_ns, _pod, _container, _cmd, stdout, _stderr, _stdin, _tty, callback) => {
+      (
+        _ns,
+        _pod,
+        _container,
+        _cmd,
+        stdout,
+        _stderr,
+        _stdin,
+        _tty,
+        callback
+      ) => {
         for (let i = 0; i < 30; i++) {
           stdout.write(`line ${i}\n`)
         }

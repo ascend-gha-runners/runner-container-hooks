@@ -138,7 +138,9 @@ describe('getContainerErrors', () => {
     const errors = getContainerErrors(pod)
     expect(errors).toHaveLength(1)
     expect(errors[0]).toContain('  ✗ container "job": ImagePullBackOff')
-    expect(errors[0]).toContain('Back-off pulling image "does-not-exist:latest"')
+    expect(errors[0]).toContain(
+      'Back-off pulling image "does-not-exist:latest"'
+    )
     expect(errors[0]).toContain('registry')
     expect(errors[0]).toContain('TLS')
   })
@@ -147,7 +149,9 @@ describe('getContainerErrors', () => {
     // ErrImagePull fires on the first pull failure (could be a TLS timeout).
     // k8s will retry and promote to ImagePullBackOff if it keeps failing.
     const pod = buildPod(PodPhase.PENDING, {
-      containerStatuses: [waitingContainer('job', 'ErrImagePull', 'TLS handshake timeout')]
+      containerStatuses: [
+        waitingContainer('job', 'ErrImagePull', 'TLS handshake timeout')
+      ]
     })
     expect(getContainerErrors(pod)).toEqual([])
   })
@@ -258,7 +262,9 @@ describe('getPodEventErrors', () => {
     }
     // No message at all — unknown cause, treat as transient
     eventSpy.mockResolvedValue(
-      eventResult([{ type: 'Warning', reason: 'FailedScheduling' } as k8s.CoreV1Event])
+      eventResult([
+        { type: 'Warning', reason: 'FailedScheduling' } as k8s.CoreV1Event
+      ])
     )
     expect(await getPodEventErrors('my-pod')).toEqual([])
   })
@@ -280,7 +286,9 @@ describe('getPodEventErrors', () => {
 
   it('ignores Normal-type events even if the reason matches', async () => {
     eventSpy.mockResolvedValue(
-      eventResult([buildEvent('FailedMount', 'volume not found', { type: 'Normal' })])
+      eventResult([
+        buildEvent('FailedMount', 'volume not found', { type: 'Normal' })
+      ])
     )
     expect(await getPodEventErrors('my-pod')).toEqual([])
   })
@@ -349,14 +357,28 @@ describe('isPermanentSchedulingFailure', () => {
   })
 
   it('returns false for resource shortages (transient — keep queuing)', () => {
-    expect(isPermanentSchedulingFailure('0/3 nodes are available: 3 Insufficient nvidia.com/gpu.')).toBe(false)
-    expect(isPermanentSchedulingFailure('0/5 nodes are available: 5 Insufficient memory.')).toBe(false)
-    expect(isPermanentSchedulingFailure('0/2 nodes are available: 2 Insufficient cpu.')).toBe(false)
+    expect(
+      isPermanentSchedulingFailure(
+        '0/3 nodes are available: 3 Insufficient nvidia.com/gpu.'
+      )
+    ).toBe(false)
+    expect(
+      isPermanentSchedulingFailure(
+        '0/5 nodes are available: 5 Insufficient memory.'
+      )
+    ).toBe(false)
+    expect(
+      isPermanentSchedulingFailure(
+        '0/2 nodes are available: 2 Insufficient cpu.'
+      )
+    ).toBe(false)
   })
 
   it('returns false for ambiguous / unknown messages (safe default: keep queuing)', () => {
     expect(isPermanentSchedulingFailure('0/1 nodes are available')).toBe(false)
-    expect(isPermanentSchedulingFailure('preemption: 0/3 nodes are available')).toBe(false)
+    expect(
+      isPermanentSchedulingFailure('preemption: 0/3 nodes are available')
+    ).toBe(false)
     expect(isPermanentSchedulingFailure(undefined)).toBe(false)
   })
 
@@ -438,9 +460,7 @@ describe('getContainerTerminatedErrors', () => {
 
   it('returns no errors for terminated containers with recoverable reasons', () => {
     const pod = buildPod(PodPhase.SUCCEEDED, {
-      containerStatuses: [
-        terminatedContainer('fs-init', 'Completed', 0)
-      ]
+      containerStatuses: [terminatedContainer('fs-init', 'Completed', 0)]
     })
     expect(getContainerTerminatedErrors(pod)).toEqual([])
   })
@@ -448,12 +468,19 @@ describe('getContainerTerminatedErrors', () => {
   it('detects OOMKilled and includes hint', () => {
     const pod = buildPod(PodPhase.FAILED, {
       containerStatuses: [
-        terminatedContainer('job', 'OOMKilled', 137, 'The node was low on resource: memory')
+        terminatedContainer(
+          'job',
+          'OOMKilled',
+          137,
+          'The node was low on resource: memory'
+        )
       ]
     })
     const errors = getContainerTerminatedErrors(pod)
     expect(errors).toHaveLength(1)
-    expect(errors[0]).toContain('  ✗ container "job": OOMKilled (exit code 137)')
+    expect(errors[0]).toContain(
+      '  ✗ container "job": OOMKilled (exit code 137)'
+    )
     expect(errors[0]).toContain('The node was low on resource: memory')
     expect(errors[0]).toContain('memory limit')
   })
@@ -488,12 +515,19 @@ describe('getContainerTerminatedErrors', () => {
   it('detects FailedPostStartHookError and includes hint', () => {
     const pod = buildPod(PodPhase.FAILED, {
       containerStatuses: [
-        terminatedContainer('job', 'FailedPostStartHookError', 137, 'postStart hook failed')
+        terminatedContainer(
+          'job',
+          'FailedPostStartHookError',
+          137,
+          'postStart hook failed'
+        )
       ]
     })
     const errors = getContainerTerminatedErrors(pod)
     expect(errors).toHaveLength(1)
-    expect(errors[0]).toContain('  ✗ container "job": FailedPostStartHookError (exit code 137)')
+    expect(errors[0]).toContain(
+      '  ✗ container "job": FailedPostStartHookError (exit code 137)'
+    )
     expect(errors[0]).toContain('postStart hook failed')
     expect(errors[0]).toContain('postStart lifecycle hook')
   })
@@ -505,7 +539,9 @@ describe('getContainerTerminatedErrors', () => {
       })
       const errors = getContainerTerminatedErrors(pod)
       expect(errors).toHaveLength(1)
-      expect(errors[0]).toContain(`  ✗ container "job": ${reason} (exit code 1)`)
+      expect(errors[0]).toContain(
+        `  ✗ container "job": ${reason} (exit code 1)`
+      )
     }
   })
 
@@ -517,14 +553,14 @@ describe('getContainerTerminatedErrors', () => {
     const errors = getContainerTerminatedErrors(pod)
     expect(errors).toHaveLength(2)
     expect(errors[0]).toContain('  ✗ container "init": Error (exit code 2)')
-    expect(errors[1]).toContain('  ✗ container "job": OOMKilled (exit code 137)')
+    expect(errors[1]).toContain(
+      '  ✗ container "job": OOMKilled (exit code 137)'
+    )
   })
 
   it('ignores terminated with reason not in the whitelist', () => {
     const pod = buildPod(PodPhase.SUCCEEDED, {
-      containerStatuses: [
-        terminatedContainer('job', 'Completed', 0)
-      ]
+      containerStatuses: [terminatedContainer('job', 'Completed', 0)]
     })
     expect(getContainerTerminatedErrors(pod)).toEqual([])
   })
@@ -536,7 +572,9 @@ describe('getUnrecoverableTerminatedReasons', () => {
   })
 
   it('returns the built-in defaults when the env var is unset', () => {
-    expect(getUnrecoverableTerminatedReasons()).toEqual(UNRECOVERABLE_TERMINATED_REASONS)
+    expect(getUnrecoverableTerminatedReasons()).toEqual(
+      UNRECOVERABLE_TERMINATED_REASONS
+    )
   })
 
   it('adds extra reasons from the env var without dropping the defaults', () => {
@@ -558,7 +596,9 @@ describe('getUnrecoverableTerminatedReasons', () => {
     })
     const errors = getContainerTerminatedErrors(pod)
     expect(errors).toHaveLength(1)
-    expect(errors[0]).toContain('  ✗ container "job": DeadlineExceeded (exit code 1)')
+    expect(errors[0]).toContain(
+      '  ✗ container "job": DeadlineExceeded (exit code 1)'
+    )
   })
 
   it('filters empty strings from the env var', () => {
@@ -670,7 +710,11 @@ describe('waitForPodPhases', () => {
       ])
     )
     await expect(
-      waitForPodPhases('my-pod', new Set([PodPhase.RUNNING]), new Set([PodPhase.PENDING]))
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
     ).rejects.toThrow(/has unrecoverable errors:[\s\S]*event: FailedScheduling/)
   })
 
@@ -679,10 +723,19 @@ describe('waitForPodPhases', () => {
       .mockResolvedValueOnce(podResult(buildPod(PodPhase.PENDING)))
       .mockResolvedValueOnce(podResult(buildPod(PodPhase.RUNNING)))
     eventSpy.mockResolvedValue(
-      eventResult([buildEvent('FailedScheduling', '0/3 nodes are available: 3 Insufficient nvidia.com/gpu.')])
+      eventResult([
+        buildEvent(
+          'FailedScheduling',
+          '0/3 nodes are available: 3 Insufficient nvidia.com/gpu.'
+        )
+      ])
     )
     await expect(
-      waitForPodPhases('my-pod', new Set([PodPhase.RUNNING]), new Set([PodPhase.PENDING]))
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
     ).resolves.toBeUndefined()
   })
 

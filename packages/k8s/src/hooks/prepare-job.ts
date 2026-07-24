@@ -104,9 +104,10 @@ export async function prepareJob(
       // The boundary may be '"\nHeaders:' (real newline) or the literal
       // string ends before Headers — use the last '"' before 'Headers:' as fallback
       const headersIdx = raw.indexOf('Headers:')
-      const bodyEnd = headersIdx !== -1
-        ? raw.lastIndexOf('"', headersIdx)   // last " before Headers:
-        : raw.indexOf('"\nHeaders:')
+      const bodyEnd =
+        headersIdx !== -1
+          ? raw.lastIndexOf('"', headersIdx) // last " before Headers:
+          : raw.indexOf('"\nHeaders:')
       if (bodyStart !== -1 && bodyEnd !== -1 && bodyEnd > bodyStart) {
         // Body content is a JSON string literal (without surrounding quotes).
         // Wrap it in quotes and JSON.parse to properly unescape \" \\ \n \t etc.

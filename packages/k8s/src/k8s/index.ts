@@ -324,8 +324,14 @@ export async function execPodStepWithOutput(
   }
 
   const flushPending = () => {
-    if (pendingOut) { push(pendingOut); pendingOut = '' }
-    if (pendingErr) { push(pendingErr); pendingErr = '' }
+    if (pendingOut) {
+      push(pendingOut)
+      pendingOut = ''
+    }
+    if (pendingErr) {
+      push(pendingErr)
+      pendingErr = ''
+    }
   }
 
   const capture = new stream.Writable({
@@ -574,11 +580,11 @@ export async function execCpToPod(
         ])
 
       const { hash: got, lines: gotLines } =
-        await execCalculateOutputHashSorted(
-          podName,
-          JOB_CONTAINER_NAME,
-          ['sh', '-c', listDirAllCommand(containerPath)]
-        )
+        await execCalculateOutputHashSorted(podName, JOB_CONTAINER_NAME, [
+          'sh',
+          '-c',
+          listDirAllCommand(containerPath)
+        ])
 
       if (got !== want) {
         core.debug(
@@ -593,8 +599,12 @@ export async function execCpToPod(
         const gotMap = new Map(
           gotLines.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
         )
-        const onlyInWant = wantLines.filter(l => !gotMap.has(l.replace(/^\d+ /, '')))
-        const onlyInGot = gotLines.filter(l => !wantMap.has(l.replace(/^\d+ /, '')))
+        const onlyInWant = wantLines.filter(
+          l => !gotMap.has(l.replace(/^\d+ /, ''))
+        )
+        const onlyInGot = gotLines.filter(
+          l => !wantMap.has(l.replace(/^\d+ /, ''))
+        )
         const sizeDiff = wantLines
           .filter(l => {
             const name = l.replace(/^\d+ /, '')
@@ -702,11 +712,11 @@ export async function execCpFromPod(
   for (let i = 0; i < attempts; i++) {
     try {
       const { hash: want, lines: wantLines } =
-        await execCalculateOutputHashSorted(
-          podName,
-          JOB_CONTAINER_NAME,
-          ['sh', '-c', listDirAllCommand(containerPath)]
-        )
+        await execCalculateOutputHashSorted(podName, JOB_CONTAINER_NAME, [
+          'sh',
+          '-c',
+          listDirAllCommand(containerPath)
+        ])
 
       const { hash: got, lines: gotLines } =
         await localCalculateOutputHashSorted([
@@ -728,8 +738,12 @@ export async function execCpFromPod(
         const gotMap = new Map(
           gotLines.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
         )
-        const onlyInWant = wantLines.filter(l => !gotMap.has(l.replace(/^\d+ /, '')))
-        const onlyInGot = gotLines.filter(l => !wantMap.has(l.replace(/^\d+ /, '')))
+        const onlyInWant = wantLines.filter(
+          l => !gotMap.has(l.replace(/^\d+ /, ''))
+        )
+        const onlyInGot = gotLines.filter(
+          l => !wantMap.has(l.replace(/^\d+ /, ''))
+        )
         const sizeDiff = wantLines
           .filter(l => {
             const name = l.replace(/^\d+ /, '')
@@ -872,7 +886,7 @@ export const UNRECOVERABLE_WAITING_REASONS = new Set([
   'InvalidImageName',
   // Container spec is invalid (bad env vars, resource limits, securityContext) —
   // cannot self-heal without a config fix.
-  'CreateContainerConfigError',
+  'CreateContainerConfigError'
   // CreateContainerError is excluded: it is sometimes emitted transiently by the
   // container runtime (e.g. during a node-level runtime restart). It can
   // self-resolve on the next kubelet retry cycle.
@@ -930,7 +944,7 @@ export const PERMANENT_SCHEDULING_PATTERNS: readonly RegExp[] = [
   // PVC referenced in the pod spec does not exist in the namespace. The
   // scheduler refuses to place the pod until the PVC is created. The workflow
   // job spec is wrong — it won't self-resolve.
-  /persistentvolumeclaim "[^"]+" not found/i,
+  /persistentvolumeclaim "[^"]+" not found/i
 ]
 
 export const UNRECOVERABLE_TERMINATED_REASONS = new Set([
@@ -981,7 +995,8 @@ export function getUnrecoverableEventReasons(): Set<string> {
 }
 
 export function getUnrecoverableTerminatedReasons(): Set<string> {
-  const extra = process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_TERMINATED_REASONS']
+  const extra =
+    process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_TERMINATED_REASONS']
   if (!extra) {
     return UNRECOVERABLE_TERMINATED_REASONS
   }
@@ -1001,7 +1016,9 @@ export function getUnrecoverableTerminatedReasons(): Set<string> {
 //   - absent/empty messages   → unknown, assume transient
 //   - resource shortages      → Insufficient cpu/memory/gpu/etc.
 //   - any unrecognised format → unknown, assume transient
-export function isPermanentSchedulingFailure(message: string | undefined): boolean {
+export function isPermanentSchedulingFailure(
+  message: string | undefined
+): boolean {
   if (!message) return false
   return getPermanentSchedulingPatterns().some(p => p.test(message))
 }
@@ -1046,7 +1063,7 @@ function getWaitingReasonHint(reason: string): string {
         `    - Image name and tag are correct and exist in the registry`,
         `    - If private registry: imagePullSecret is configured and credentials are valid`,
         `    - Network connectivity from the node to the registry (DNS, firewall, proxy, TLS)`,
-        `    Run: kubectl describe pod <pod> | grep -A10 "Events"`,
+        `    Run: kubectl describe pod <pod> | grep -A10 "Events"`
       ].join('\n')
     case 'InvalidImageName':
       return `  → Image name is malformed. Check the workflow/job container image configuration.`
@@ -1076,7 +1093,10 @@ export function getContainerErrors(pod: k8s.V1Pod): string[] {
   return errors
 }
 
-export function getTerminatedReasonHint(reason: string, exitCode: number | undefined): string {
+export function getTerminatedReasonHint(
+  reason: string,
+  exitCode: number | undefined
+): string {
   if (reason === 'OOMKilled') {
     return `  → Container exceeded its memory limit and was killed by the OOM killer.\n    Increase the memory limit in the job spec or reduce memory usage in the script.`
   }
@@ -1126,21 +1146,21 @@ function getEventReasonHint(reason: string): string {
         `  → A volume could not be mounted. Check:`,
         `    - PVC is bound (kubectl get pvc)`,
         `    - Secret/ConfigMap referenced in the volume exists`,
-        `    - hostPath directories exist on the scheduled node`,
+        `    - hostPath directories exist on the scheduled node`
       ].join('\n')
     case 'FailedBinding':
       return [
         `  → A PVC could not be bound to a PV. Check:`,
         `    - StorageClass exists and has a provisioner`,
         `    - Sufficient capacity is available`,
-        `    - Access mode (ReadWriteOnce/ReadWriteMany) matches available PVs`,
+        `    - Access mode (ReadWriteOnce/ReadWriteMany) matches available PVs`
       ].join('\n')
     case 'FailedScheduling':
       return [
         `  → Pod cannot be scheduled due to a permanent configuration error. Check:`,
         `    - nodeSelector / nodeAffinity labels match at least one node`,
         `    - All tolerations are present for node taints`,
-        `    - PVCs referenced in the pod spec exist in the namespace`,
+        `    - PVCs referenced in the pod spec exist in the namespace`
       ].join('\n')
     default:
       return `  → Check pod events with: kubectl describe pod <pod>`
@@ -1180,13 +1200,20 @@ export async function getPodEventErrors(podName: string): Promise<string[]> {
   const errors: string[] = []
   const seenReasons = new Set<string>()
   for (const e of items) {
-    if (e.type !== 'Warning' || !e.reason || !unrecoverableReasons.has(e.reason)) {
+    if (
+      e.type !== 'Warning' ||
+      !e.reason ||
+      !unrecoverableReasons.has(e.reason)
+    ) {
       continue
     }
     // FailedScheduling: only fast-fail when the message positively matches a
     // known-permanent config error. Resource shortages and unknown messages
     // are treated as transient — let the pod keep queuing.
-    if (e.reason === 'FailedScheduling' && !isPermanentSchedulingFailure(e.message)) {
+    if (
+      e.reason === 'FailedScheduling' &&
+      !isPermanentSchedulingFailure(e.message)
+    ) {
       core.debug(
         `[fast-fail] Skipping FailedScheduling (not a recognised permanent error): ${
           e.message ?? '(no message)'
@@ -1260,7 +1287,9 @@ export async function describePodFailure(podName: string): Promise<string> {
       // first line to avoid printing the same error twice.
       if (!unrecoverableReasons.has(waiting.reason)) {
         const msg = waiting.message ? `\n    ${waiting.message}` : ''
-        containerLines.push(`  ✗ container "${cs.name}" waiting: ${waiting.reason}${msg}`)
+        containerLines.push(
+          `  ✗ container "${cs.name}" waiting: ${waiting.reason}${msg}`
+        )
       }
     }
     const terminated = cs.state?.terminated
@@ -1363,9 +1392,17 @@ export async function checkUnrecoverableErrors(
   // a few extra seconds to propagate, so always run the check. Deduplicate
   // against events so the same FailedScheduling isn't printed twice.
   const conditionErrors = getPodConditionErrors(pod).filter(
-    c => !eventErrors.some(e => e.includes('FailedScheduling') && c.includes('Unschedulable'))
+    c =>
+      !eventErrors.some(
+        e => e.includes('FailedScheduling') && c.includes('Unschedulable')
+      )
   )
-  return [...containerErrors, ...terminatedErrors, ...eventErrors, ...conditionErrors]
+  return [
+    ...containerErrors,
+    ...terminatedErrors,
+    ...eventErrors,
+    ...conditionErrors
+  ]
 }
 
 export async function waitForPodPhases(

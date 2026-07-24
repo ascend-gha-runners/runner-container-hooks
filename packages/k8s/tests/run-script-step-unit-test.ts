@@ -39,9 +39,7 @@ describe('runScriptStep error classification', () => {
       runnerPath: '/tmp/test-script.sh'
     })
 
-    execPodStepSpy = jest
-      .spyOn(k8sModule, 'execPodStep')
-      .mockResolvedValue(0)
+    execPodStepSpy = jest.spyOn(k8sModule, 'execPodStep').mockResolvedValue(0)
 
     execCpToPodSpy = jest
       .spyOn(k8sModule, 'execCpToPod')
@@ -51,8 +49,7 @@ describe('runScriptStep error classification', () => {
       .spyOn(k8sModule, 'execCpFromPod')
       .mockResolvedValue(undefined)
 
-    execPodStepWithOutputSpy = jest
-      .spyOn(k8sModule, 'execPodStepWithOutput')
+    execPodStepWithOutputSpy = jest.spyOn(k8sModule, 'execPodStepWithOutput')
   })
 
   afterEach(() => {

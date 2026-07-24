@@ -8,7 +8,7 @@ module.exports = {
   verbose: true,
   collectCoverage: true,
   coverageReporters: ['clover', 'json', 'lcov', 'text'],
-  coverageDirectory: 'coverage',
+  coverageDirectory: '../../coverage',
   transform: {
     '^.+\\.ts$': [
       'ts-jest',

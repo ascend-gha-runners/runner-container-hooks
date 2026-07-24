@@ -33,13 +33,17 @@ describe('generateContainerName', () => {
     expect(generateContainerName('postgres:latest')).toBe('postgres')
     expect(generateContainerName('postgres')).toBe('postgres')
     expect(
-      generateContainerName('public.ecr.aws/url/with/multiple/slashes/postgres:latest')
+      generateContainerName(
+        'public.ecr.aws/url/with/multiple/slashes/postgres:latest'
+      )
     ).toBe('postgres')
   })
 
   it('throws on invalid image string', () => {
     expect(() => generateContainerName(':latest')).toThrow()
-    expect(() => generateContainerName('localstack/localstack/:latest')).toThrow()
+    expect(() =>
+      generateContainerName('localstack/localstack/:latest')
+    ).toThrow()
   })
 })
 
@@ -144,7 +148,10 @@ describe('writeRunScript', () => {
   })
 
   it('returns containerPath and runnerPath', () => {
-    const { containerPath, runnerPath } = writeRunScript('/work', 'sh', ['-e', 'script.sh'])
+    const { containerPath, runnerPath } = writeRunScript('/work', 'sh', [
+      '-e',
+      'script.sh'
+    ])
     expect(containerPath).toMatch(/\/__w\/_temp\/.*\.sh/)
     expect(runnerPath).toContain(tmpDir)
     expect(fs.existsSync(runnerPath)).toBe(true)
@@ -175,7 +182,7 @@ describe('writeRunScript', () => {
 
   it('throws if env key contains "$"', () => {
     expect(() =>
-      writeRunScript('/work', 'sh', [], [], { 'BAD$KEY': 'val' })
+      writeRunScript('/work', 'sh', [], [], { BAD$KEY: 'val' })
     ).toThrow()
   })
 })
@@ -205,9 +212,9 @@ describe('writeContainerStepScript', () => {
   })
 
   it('throws on invalid working directory', () => {
-    expect(() =>
-      writeContainerStepScript(tmpDir, 'tooshort', 'sh')
-    ).toThrow('Invalid working directory')
+    expect(() => writeContainerStepScript(tmpDir, 'tooshort', 'sh')).toThrow(
+      'Invalid working directory'
+    )
   })
 
   it('throws if env key contains invalid chars', () => {
@@ -234,7 +241,11 @@ describe('prepareJobScript', () => {
 
   it('returns paths and file exists', () => {
     const { containerPath, runnerPath } = prepareJobScript([
-      { sourceVolumePath: '/src', targetVolumePath: '/mnt/data', readOnly: false }
+      {
+        sourceVolumePath: '/src',
+        targetVolumePath: '/mnt/data',
+        readOnly: false
+      }
     ])
     expect(containerPath).toMatch(/\/__w\/_temp\/.*\.sh/)
     expect(fs.existsSync(runnerPath)).toBe(true)
@@ -242,8 +253,16 @@ describe('prepareJobScript', () => {
 
   it('includes mkdir for each mount target', () => {
     const { runnerPath } = prepareJobScript([
-      { sourceVolumePath: '/s1', targetVolumePath: '/mnt/vol1', readOnly: false },
-      { sourceVolumePath: '/s2', targetVolumePath: '/mnt/vol2', readOnly: false }
+      {
+        sourceVolumePath: '/s1',
+        targetVolumePath: '/mnt/vol1',
+        readOnly: false
+      },
+      {
+        sourceVolumePath: '/s2',
+        targetVolumePath: '/mnt/vol2',
+        readOnly: false
+      }
     ])
     const content = fs.readFileSync(runnerPath, 'utf8')
     expect(content).toContain('/mnt/vol1')

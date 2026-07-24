@@ -60,7 +60,8 @@ export async function runContainerStep(
   } catch (err) {
     core.debug(`createJob failed: ${JSON.stringify(err)}`)
     const bodyMsg = (err as any)?.response?.body?.message
-    const message = bodyMsg ?? (err instanceof Error ? err.message : String(err))
+    const message =
+      bodyMsg ?? (err instanceof Error ? err.message : String(err))
     throw new Error(`failed to run container step: ${message}`)
   }
 

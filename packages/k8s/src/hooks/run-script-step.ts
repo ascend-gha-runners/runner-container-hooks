@@ -2,7 +2,12 @@
 import * as fs from 'fs'
 import * as core from '@actions/core'
 import { RunScriptStepArgs } from 'hooklib'
-import { execCpFromPod, execCpToPod, execPodStep, execPodStepWithOutput } from '../k8s'
+import {
+  execCpFromPod,
+  execCpToPod,
+  execPodStep,
+  execPodStepWithOutput
+} from '../k8s'
 import { writeRunScript } from '../k8s/utils'
 import { JOB_CONTAINER_NAME } from './constants'
 import { dirname } from 'path'
@@ -84,7 +89,10 @@ export async function runScriptStep(
     }
   } catch (err) {
     core.debug(`execPodStep failed: ${JSON.stringify(err)}`)
-    if (err instanceof Error && err.message.startsWith('failed to run script step')) {
+    if (
+      err instanceof Error &&
+      err.message.startsWith('failed to run script step')
+    ) {
       throw err
     }
     const message = (err as any)?.response?.body?.message || err

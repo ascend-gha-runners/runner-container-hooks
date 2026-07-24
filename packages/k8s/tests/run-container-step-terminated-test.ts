@@ -66,17 +66,22 @@ describe('runContainerStep terminated error detection', () => {
 
     waitForPodPhasesSpy = jest
       .spyOn(k8sModule, 'waitForPodPhases')
-      .mockRejectedValue(new Error('Pod test-step-pod has unrecoverable errors'))
+      .mockRejectedValue(
+        new Error('Pod test-step-pod has unrecoverable errors')
+      )
 
-    getPodByNameSpy = jest
-      .spyOn(k8sModule, 'getPodByName')
+    getPodByNameSpy = jest.spyOn(k8sModule, 'getPodByName')
 
-    getContainerTerminatedErrorsSpy = jest
-      .spyOn(k8sModule, 'getContainerTerminatedErrors')
+    getContainerTerminatedErrorsSpy = jest.spyOn(
+      k8sModule,
+      'getContainerTerminatedErrors'
+    )
 
     describePodFailureSpy = jest
       .spyOn(k8sModule, 'describePodFailure')
-      .mockResolvedValue('Pod status: Failed\nContainer details:\n  ✗ container "job" terminated: OOMKilled (exit code 137)')
+      .mockResolvedValue(
+        'Pod status: Failed\nContainer details:\n  ✗ container "job" terminated: OOMKilled (exit code 137)'
+      )
 
     deletePodSpy = jest
       .spyOn(k8sModule, 'deletePod')
@@ -96,7 +101,12 @@ describe('runContainerStep terminated error detection', () => {
   it('detects OOMKilled and logs describePodFailure output', async () => {
     getPodByNameSpy.mockResolvedValue(
       buildPodWithTerminated([
-        terminatedContainer('job', 'OOMKilled', 137, 'The node was low on resource: memory')
+        terminatedContainer(
+          'job',
+          'OOMKilled',
+          137,
+          'The node was low on resource: memory'
+        )
       ])
     )
     getContainerTerminatedErrorsSpy.mockReturnValue([
@@ -115,9 +125,7 @@ describe('runContainerStep terminated error detection', () => {
 
   it('detects Error (exit non-zero) and logs describePodFailure output', async () => {
     getPodByNameSpy.mockResolvedValue(
-      buildPodWithTerminated([
-        terminatedContainer('job', 'Error', 1)
-      ])
+      buildPodWithTerminated([terminatedContainer('job', 'Error', 1)])
     )
     getContainerTerminatedErrorsSpy.mockReturnValue([
       '  ✗ container "job": Error (exit code 1)'
@@ -136,7 +144,12 @@ describe('runContainerStep terminated error detection', () => {
   it('detects FailedPostStartHookError and logs describePodFailure output', async () => {
     getPodByNameSpy.mockResolvedValue(
       buildPodWithTerminated([
-        terminatedContainer('job', 'FailedPostStartHookError', 137, 'postStart hook failed')
+        terminatedContainer(
+          'job',
+          'FailedPostStartHookError',
+          137,
+          'postStart hook failed'
+        )
       ])
     )
     getContainerTerminatedErrorsSpy.mockReturnValue([
