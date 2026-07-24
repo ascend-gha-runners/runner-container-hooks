@@ -298,3 +298,59 @@ export async function sleep(ms: number): Promise<void> {
 export function listDirAllCommand(dir: string): string {
   return `cd ${shlex.quote(dir)} && find . -type f -not -path '*/_runner_hook_responses*' -exec stat -c '%s %n' {} \\;`
 }
+
+/**
+ * Safely extract a human-readable message from any throwable.
+ *
+ * Priority:
+ *  1. Error.message for native Error instances.
+ *  2. Kubernetes-style response.body.message + optional reason.
+ *  3. Top-level body.message when response is absent.
+ *  4. Top-level .message on any object.
+ *  5. String() of primitives and null/undefined.
+ *  6. JSON.stringify for plain objects (with circular-reference protection).
+ *  7. String() as last resort (catches objects whose toJSON throws).
+ */
+export function formatError(err: unknown): string {
+  if (err instanceof Error) {
+    return err.message
+  }
+
+  if (typeof err === 'object' && err !== null) {
+    // Kubernetes client errors: { response: { body: { message, reason } } }
+    const k8sErr = err as Record<string, unknown>
+    const response = k8sErr.response as Record<string, unknown> | undefined
+    const body = response?.body as Record<string, unknown> | undefined
+    const bodyMessage = body?.message as string | undefined
+    const reason = body?.reason as string | undefined
+
+    if (bodyMessage !== undefined) {
+      return reason ? `${bodyMessage} (reason: ${reason})` : bodyMessage
+    }
+
+    // Fallback: top-level body.message (no response wrapper)
+    const topBody = k8sErr.body as Record<string, unknown> | undefined
+    const topBodyMessage = topBody?.message as string | undefined
+    if (topBodyMessage !== undefined) {
+      return topBodyMessage
+    }
+
+    // Plain object with a .message field
+    const msg = k8sErr.message as string | undefined
+    if (msg !== undefined) {
+      return msg
+    }
+
+    // Try JSON.stringify with circular-reference protection
+    try {
+      return JSON.stringify(err)
+    } catch {
+      // JSON.stringify threw (circular or evil toJSON) — fall through
+    }
+  }
+
+  // Primitives, null, undefined, or anything JSON.stringify couldn't handle
+  if (err === null) return 'null'
+  if (err === undefined) return 'undefined'
+  return String(err)
+}

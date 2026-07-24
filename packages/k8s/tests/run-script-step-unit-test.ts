@@ -94,7 +94,7 @@ describe('runScriptStep error classification', () => {
     expect(caughtErr).toBeDefined()
     expect(caughtErr?.message).toContain('script output line')
     expect(caughtErr?.message).toContain('Last output:')
-    expect(caughtErr?.message).toContain('─')
+    expect(caughtErr?.message).toContain('-'.repeat(60))
   })
 
   it('throws generic error when execPodStepWithOutput rejects with non-exit error', async () => {

@@ -146,7 +146,10 @@ export async function prepareJob(
     `Job pod created, waiting for it to come online ${createdPod?.metadata?.name}`
   )
 
-  const runnerWorkspace = dirname(process.env.RUNNER_WORKSPACE as string)
+  if (!process.env.RUNNER_WORKSPACE) {
+    throw new Error('RUNNER_WORKSPACE is not set')
+  }
+  const runnerWorkspace = dirname(process.env.RUNNER_WORKSPACE)
 
   let prepareScript: { containerPath: string; runnerPath: string } | undefined
   if (args.container?.userMountVolumes?.length) {
