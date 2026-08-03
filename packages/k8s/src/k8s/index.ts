@@ -1559,7 +1559,10 @@ export async function getPodLogs(
     pretty: false,
     timestamps: false
   })
-  await new Promise(resolve => logStream.on('end', () => resolve(null)))
+  await new Promise((resolve, reject) => {
+    logStream.on('end', () => resolve(null))
+    logStream.on('error', err => reject(err))
+  })
 }
 
 export async function prunePods(): Promise<void> {

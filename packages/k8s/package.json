@@ -20,6 +20,7 @@
     "hooklib": "file:../hooklib",
     "js-yaml": "^5.2.1",
     "shlex": "^3.0.0",
+    "stream-buffers": "^3.0.2",
     "tar-fs": "^3.1.2",
     "uuid": "^14.0.1"
   },
