@@ -154,7 +154,7 @@ describe('error serialization', () => {
           new Set([PodPhase.RUNNING]),
           new Set([PodPhase.PENDING])
         )
-      ).rejects.toThrow(/Pod test-pod is unhealthy with phase status Failed/)
+      ).rejects.toThrow(/Pod test-pod is unhealthy \(phase: Failed\)/)
     })
 
     it('should include Error.message when API call throws', async () => {
@@ -164,10 +164,11 @@ describe('error serialization', () => {
         waitForPodPhases(
           'test-pod',
           new Set([PodPhase.RUNNING]),
-          new Set([PodPhase.PENDING])
+          new Set([PodPhase.PENDING]),
+          0.1
         )
       ).rejects.toThrow(
-        'Pod test-pod is unhealthy with phase status Unknown: network timeout'
+        /Pod test-pod timed out after .*s \(pod read failed: network timeout\)/
       )
     })
 
@@ -178,7 +179,8 @@ describe('error serialization', () => {
         await waitForPodPhases(
           'test-pod',
           new Set([PodPhase.RUNNING]),
-          new Set([PodPhase.PENDING])
+          new Set([PodPhase.PENDING]),
+          0.1
         )
         fail('Expected waitForPodPhases to throw')
       } catch (error) {

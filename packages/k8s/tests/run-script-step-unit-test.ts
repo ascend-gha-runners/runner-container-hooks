@@ -35,6 +35,12 @@ describe('runScriptStep error classification', () => {
       runnerPath: '/tmp/test-script.sh'
     })
 
+    // Mock the pod-exec helpers runScriptStep calls before execPodStepWithOutput
+    // so tests don't hit a real k8s API / retry loop.
+    jest.spyOn(k8sModule, 'execCpToPod').mockResolvedValue(undefined)
+    jest.spyOn(k8sModule, 'execPodStep').mockResolvedValue(0)
+    jest.spyOn(k8sModule, 'execCpFromPod').mockResolvedValue(undefined)
+
     execPodStepWithOutputSpy = jest.spyOn(k8sModule, 'execPodStepWithOutput')
   })
 

@@ -22,7 +22,8 @@ import {
   sleep,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
-  WORK_VOLUME
+  WORK_VOLUME,
+  formatError
 } from './utils'
 import * as shlex from 'shlex'
 
@@ -561,7 +562,7 @@ export async function execCpToPod(
       attempt++
       if (attempt >= 30) {
         throw new Error(
-          `cpToPod failed after ${attempt} attempts: ${JSON.stringify(error)}`
+          `cpToPod failed after ${attempt} attempts: ${formatError(error)}`
         )
       }
       await sleep(1000)
@@ -700,7 +701,7 @@ export async function execCpFromPod(
       attempt++
       if (attempt >= 30) {
         throw new Error(
-          `execCpFromPod failed after ${attempt} attempts: ${JSON.stringify(error)}`
+          `execCpFromPod failed after ${attempt} attempts: ${formatError(error)}`
         )
       }
       await sleep(1000)
@@ -776,7 +777,7 @@ export async function waitForJobToComplete(jobName: string): Promise<void> {
         return
       }
     } catch (error) {
-      throw new Error(`job ${jobName} has failed: ${JSON.stringify(error)}`)
+      throw new Error(`job ${jobName} has failed: ${formatError(error)}`)
     }
     await backOffManager.backOff()
   }
