@@ -52,11 +52,12 @@ describe('fixArgs', () => {
     expect(fixArgs(['"Hello', 'World"'])).toStrictEqual(['Hello World'])
   })
 
-  it('handles single-quoted shell args', () => {
-    expect(fixArgs(['sh', '-c', "'echo hello'"])).toStrictEqual([
+  it('preserves sh -c scripts without re-tokenizing', () => {
+    // Retokenizing would split the script into multiple args, breaking `sh -c`.
+    expect(fixArgs(['sh', '-c', 'echo hello world'])).toStrictEqual([
       'sh',
       '-c',
-      'echo hello'
+      'echo hello world'
     ])
   })
 
