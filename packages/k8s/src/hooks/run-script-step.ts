@@ -11,7 +11,6 @@ import {
 import { writeRunScript } from '../k8s/utils'
 import { JOB_CONTAINER_NAME } from './constants'
 import { dirname } from 'path'
-import * as shlex from 'shlex'
 
 function formatScriptError(exitCode: number, tailOutput: string): string {
   const sep = '-'.repeat(60)
@@ -67,7 +66,7 @@ export async function runScriptStep(
 
   try {
     await execPodStep(
-      ['sh', '-c', shlex.quote(setupCommands.join(' && '))],
+      ['sh', '-c', setupCommands.join(' && ')],
       state.jobPod,
       JOB_CONTAINER_NAME
     )
