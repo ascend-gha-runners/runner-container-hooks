@@ -1,3 +1,6 @@
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import * as k8s from '@kubernetes/client-node'
 import {
   namespace,
@@ -37,9 +40,29 @@ import {
   getPodLogs,
   getPodByName,
   execPodStepWithOutput,
-  execPodStep
+  execPodStep,
+  execCpToPod,
+  execCpFromPod
 } from '../index'
 import { PodPhase } from './index'
+
+// Mock sleep so cp retry loops (up to 30 × 1s) run instantly in tests.
+vi.mock('./index', async importOriginal => {
+  const actual = await importOriginal<typeof import('./index')>()
+  return { ...actual, sleep: vi.fn().mockResolvedValue(undefined) }
+})
+
+// Mock tar-fs so execCpToPod/execCpFromPod don't touch the real filesystem
+// (avoids async stream reads racing test teardown).
+vi.mock('tar-fs', () => {
+  const { PassThrough } = require('stream')
+  return {
+    default: {
+      pack: vi.fn().mockReturnValue(new PassThrough()),
+      extract: vi.fn().mockReturnValue(new PassThrough())
+    }
+  }
+})
 
 vi.mock('@actions/core', () => ({
   debug: vi.fn(),
@@ -1876,4 +1899,138 @@ describe('execPodStep', () => {
     })
     await expect(execPodStep(['fail'], 'my-pod', 'job')).rejects.toThrow('oops')
   }, 10000)
+})
+
+// ── execCpToPod / execCpFromPod (errStream reject paths) ──────────────────────
+
+describe('execCpToPod', () => {
+  let execSpy: ReturnType<typeof vi.spyOn>
+  let tmpDir: string
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cptopod-'))
+    fs.writeFileSync(path.join(tmpDir, 'file.txt'), 'hello')
+    execSpy = vi.spyOn(k8s.Exec.prototype, 'exec' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('rejects with errStream details when the pod-side command writes to stderr', async () => {
+    execSpy.mockImplementation(async function (
+      this: any,
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      _stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
+    ) {
+      // The impl passes errStream as _stderr. Write content then fire the
+      // status callback so the impl's status handler sees errStream.size() > 0
+      // and rejects.
+      void Promise.resolve().then(() => {
+        ;(_stderr as unknown as { write: (s: string) => void }).write(
+          'tar: error opening archive: no such file'
+        )
+        statusCb({ status: 'Failure' })
+      })
+      return Promise.resolve(null)
+    })
+
+    await expect(execCpToPod('my-pod', tmpDir, '/workspace')).rejects.toThrow(
+      'Error from execCpToPod'
+    )
+  }, 10000)
+
+  it('retries then throws after all attempts when exec keeps failing', async () => {
+    execSpy.mockRejectedValue(new Error('connection refused') as never)
+    await expect(execCpToPod('my-pod', tmpDir, '/workspace')).rejects.toThrow(
+      'cpToPod failed after 30 attempts'
+    )
+  }, 15000)
+})
+
+describe('execCpFromPod', () => {
+  let execSpy: ReturnType<typeof vi.spyOn>
+  let tmpDir: string
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cpfrompod-'))
+    execSpy = vi.spyOn(k8s.Exec.prototype, 'exec' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('rejects with errStream details when the pod-side tar writes to stderr', async () => {
+    execSpy.mockImplementation(async function (
+      this: any,
+      _ns,
+      _pod,
+      _c,
+      _cmd,
+      _stdout,
+      _stderr,
+      _stdin,
+      _tty,
+      statusCb
+    ) {
+      // The impl wires writerStream as stdout and errStream as stderr.
+      // Write to errStream then fire the status callback so the impl rejects.
+      void Promise.resolve().then(() => {
+        ;(_stderr as unknown as { write: (s: string) => void }).write(
+          'tar: no such file or directory'
+        )
+        statusCb({ status: 'Failure' })
+      })
+      return Promise.resolve(null)
+    })
+
+    await expect(
+      execCpFromPod('my-pod', '/workspace/output', tmpDir)
+    ).rejects.toThrow('Error from cpFromPod')
+  }, 10000)
+})
+
+// ── waitForPodPhases backoff timeout ──────────────────────────────────────────
+
+describe('waitForPodPhases timeout path', () => {
+  let readSpy: ReturnType<typeof vi.spyOn>
+  let eventSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    readSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'readNamespacedPod' as any)
+    eventSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'listNamespacedEvent' as any)
+    eventSpy.mockResolvedValue(eventResult([]))
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('throws timed-out message when pod stays in a backoff phase past maxTimeSeconds', async () => {
+    readSpy.mockResolvedValue(podResult(buildPod(PodPhase.PENDING)))
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING]),
+        0.1
+      )
+    ).rejects.toThrow(/timed out after 0\.1s/)
+  }, 5000)
 })

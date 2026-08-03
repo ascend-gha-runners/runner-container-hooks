@@ -14,6 +14,7 @@ import {
   sleep,
   listDirAllCommand,
   useKubeScheduler,
+  formatError,
   ENV_HOOK_TEMPLATE_PATH,
   ENV_USE_KUBE_SCHEDULER
 } from './index'
@@ -63,6 +64,55 @@ describe('fixArgs', () => {
 
   it('returns plain args unchanged', () => {
     expect(fixArgs(['ls', '-la', '/tmp'])).toStrictEqual(['ls', '-la', '/tmp'])
+  })
+})
+
+describe('formatError', () => {
+  it('returns the message of a standard Error', () => {
+    expect(formatError(new Error('connection refused'))).toBe(
+      'connection refused'
+    )
+  })
+
+  it('extracts response.body.message with reason from k8s errors', () => {
+    const k8sErr = {
+      message: 'HTTP request failed',
+      response: {
+        body: { message: 'forbidden', reason: 'Forbidden', code: 403 }
+      }
+    }
+    expect(formatError(k8sErr)).toBe('forbidden (reason: Forbidden)')
+  })
+
+  it('returns body.message without reason when reason is missing', () => {
+    expect(
+      formatError({ response: { body: { message: 'something broke' } } })
+    ).toBe('something broke')
+  })
+
+  it('falls back to top-level body.message when response is absent', () => {
+    expect(formatError({ body: { message: 'top-level body message' } })).toBe(
+      'top-level body message'
+    )
+  })
+
+  it('returns message field on a plain (non-Error) object', () => {
+    expect(formatError({ message: 'top-level msg only' })).toBe(
+      'top-level msg only'
+    )
+  })
+
+  it('serializes plain objects without message via JSON.stringify', () => {
+    expect(formatError({ code: 'ENOENT', path: '/tmp/x' })).toBe(
+      '{"code":"ENOENT","path":"/tmp/x"}'
+    )
+  })
+
+  it('handles primitives, null, undefined', () => {
+    expect(formatError('raw string error')).toBe('raw string error')
+    expect(formatError(42)).toBe('42')
+    expect(formatError(null)).toBe('null')
+    expect(formatError(undefined)).toBe('undefined')
   })
 })
 
