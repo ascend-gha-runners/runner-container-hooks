@@ -54,8 +54,8 @@ vi.mock('./index', async importOriginal => {
 
 // Mock tar-fs so execCpToPod/execCpFromPod don't touch the real filesystem
 // (avoids async stream reads racing test teardown).
-vi.mock('tar-fs', () => {
-  const { PassThrough } = require('stream')
+vi.mock('tar-fs', async () => {
+  const { PassThrough } = await import('stream')
   return {
     default: {
       pack: vi.fn().mockReturnValue(new PassThrough()),
