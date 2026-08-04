@@ -53,15 +53,18 @@ vi.mock('./index', async importOriginal => {
 })
 
 // Mock tar-fs so execCpToPod/execCpFromPod don't touch the real filesystem
-// (avoids async stream reads racing test teardown).
+// (avoids async stream reads racing test teardown). tar-fs exports
+// { pack, extract } at the top level (no default). __esModule + default
+// keeps the default-import interop working under vitest 2.x. Each call
+// returns a fresh PassThrough so earlier tests consuming one stream never
+// leak state into later ones.
 vi.mock('tar-fs', async () => {
   const { PassThrough } = await import('stream')
-  return {
-    default: {
-      pack: vi.fn().mockReturnValue(new PassThrough()),
-      extract: vi.fn().mockReturnValue(new PassThrough())
-    }
+  const impl = {
+    pack: vi.fn(() => new PassThrough()),
+    extract: vi.fn(() => new PassThrough())
   }
+  return { ...impl, __esModule: true, default: impl }
 })
 
 vi.mock('@actions/core', () => ({
