@@ -18,7 +18,6 @@ import {
 } from '../k8s'
 import {
   CONTAINER_VOLUMES,
-  formatError,
   mergeContainerWithOptions,
   PodPhase,
   readExtensionFromFile,
@@ -59,8 +58,10 @@ export async function runContainerStep(
   try {
     pod = await createContainerStepPod(getStepPodName(), container, extension)
   } catch (err) {
-    const message = formatError(err)
-    core.debug(`createContainerStepPod failed: ${message}`)
+    core.debug(`createJob failed: ${JSON.stringify(err)}`)
+    const bodyMsg = (err as any)?.response?.body?.message
+    const message =
+      bodyMsg ?? (err instanceof Error ? err.message : String(err))
     throw new Error(`failed to run container step: ${message}`)
   }
 
@@ -81,15 +82,8 @@ export async function runContainerStep(
       getPrepareJobTimeoutSeconds()
     )
 
-    const runnerWorkspaceEnv = process.env.RUNNER_WORKSPACE
-    const githubWorkspaceEnv = process.env.GITHUB_WORKSPACE
-    if (!runnerWorkspaceEnv || !githubWorkspaceEnv) {
-      throw new Error(
-        'RUNNER_WORKSPACE or GITHUB_WORKSPACE environment variable is not set'
-      )
-    }
-    const runnerWorkspace = dirname(runnerWorkspaceEnv)
-    const githubWorkspace = githubWorkspaceEnv
+    const runnerWorkspace = dirname(process.env.RUNNER_WORKSPACE as string)
+    const githubWorkspace = process.env.GITHUB_WORKSPACE as string
     const parts = githubWorkspace.split('/').slice(-2)
     if (parts.length !== 2) {
       throw new Error(`Invalid github workspace directory: ${githubWorkspace}`)
@@ -134,8 +128,8 @@ export async function runContainerStep(
       )
       throw new Error(classification)
     } catch (err) {
-      core.debug(`execPodStep failed: ${formatError(err)}`)
-      // Re-throw our classified errors verbatim; wrap anything else.
+      core.debug(`execPodStep failed: ${JSON.stringify(err)}`)
+      // Re-throw our own classified errors verbatim; wrap anything else.
       if (
         err instanceof Error &&
         (err.message.startsWith('Step failed:') ||
@@ -143,15 +137,15 @@ export async function runContainerStep(
       ) {
         throw err
       }
-      const message = formatError(err)
+      const message = (err as any)?.response?.body?.message || err
       throw new Error(`failed to run container step: ${message}`)
     } finally {
       fs.rmSync(runnerPath, { force: true })
     }
   } catch (error) {
     try {
-      const errorPod = await getPodByName(podName)
-      const terminatedErrors = getContainerTerminatedErrors(errorPod)
+      const stepPod = await getPodByName(podName)
+      const terminatedErrors = getContainerTerminatedErrors(stepPod)
       if (terminatedErrors.length > 0) {
         const details = await describePodFailure(podName)
         core.error(

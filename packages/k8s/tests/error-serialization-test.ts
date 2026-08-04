@@ -165,9 +165,11 @@ describe('error serialization', () => {
           'test-pod',
           new Set([PodPhase.RUNNING]),
           new Set([PodPhase.PENDING]),
-          1
+          0.1
         )
-      ).rejects.toThrow('network timeout')
+      ).rejects.toThrow(
+        /Pod test-pod timed out after .*s \(pod read failed: network timeout\)/
+      )
     })
 
     it('should not produce empty braces from Error objects', async () => {
@@ -178,7 +180,7 @@ describe('error serialization', () => {
           'test-pod',
           new Set([PodPhase.RUNNING]),
           new Set([PodPhase.PENDING]),
-          1
+          0.1
         )
         fail('Expected waitForPodPhases to throw')
       } catch (error) {

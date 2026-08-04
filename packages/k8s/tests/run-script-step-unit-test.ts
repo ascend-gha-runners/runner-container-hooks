@@ -35,8 +35,10 @@ describe('runScriptStep error classification', () => {
       runnerPath: '/tmp/test-script.sh'
     })
 
-    jest.spyOn(k8sModule, 'execPodStep').mockResolvedValue(0)
+    // Mock the pod-exec helpers runScriptStep calls before execPodStepWithOutput
+    // so tests don't hit a real k8s API / retry loop.
     jest.spyOn(k8sModule, 'execCpToPod').mockResolvedValue(undefined)
+    jest.spyOn(k8sModule, 'execPodStep').mockResolvedValue(0)
     jest.spyOn(k8sModule, 'execCpFromPod').mockResolvedValue(undefined)
 
     execPodStepWithOutputSpy = jest.spyOn(k8sModule, 'execPodStepWithOutput')
@@ -81,7 +83,7 @@ describe('runScriptStep error classification', () => {
     expect(caughtErr).toBeDefined()
     expect(caughtErr?.message).toContain('script output line')
     expect(caughtErr?.message).toContain('Last output:')
-    expect(caughtErr?.message).toContain('---')
+    expect(caughtErr?.message).toContain('-'.repeat(60))
   })
 
   it('throws generic error when execPodStepWithOutput rejects with non-exit error', async () => {

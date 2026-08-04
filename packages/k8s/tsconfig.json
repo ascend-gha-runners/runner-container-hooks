@@ -3,13 +3,11 @@
     "compilerOptions": {
       "baseUrl": "./",
       "outDir": "./lib",
-      "rootDir": "./src",
-      "skipLibCheck": true,
-      "types": []
+      "rootDir": "./src"
     },
-    "esModuleInterop": true,
+    "esModuleInterop": true, /* Emit additional JavaScript to ease support for importing CommonJS modules. This enables 'allowSyntheticDefaultImports' for type compatibility. */
     "include": [
-      "src/**/*"
+      "src/**/*",
     ],
     "exclude": [
       "src/**/*.spec.ts"

@@ -130,14 +130,15 @@ describe('runScriptStep', () => {
     expect(err?.message).toBe('failed to run script step: OOMKilled')
   })
 
-  it('throws when merge dirs step (execPodStep) fails', async () => {
-    // First call = mkdir -p (succeeds), second call = merge script (fails)
-    vi.mocked(k8sMod.execPodStep)
-      .mockResolvedValueOnce(0)
-      .mockRejectedValueOnce(new Error('merge failed'))
+  it('swallows execPodStep (GitHub dir setup) failure without throwing', async () => {
+    // The GitHub-dir copy step is best-effort: a failure is logged via
+    // core.debug and must not fail the run.
+    vi.mocked(k8sMod.execPodStep).mockRejectedValueOnce(
+      new Error('mkdir failed')
+    )
     await expect(
       runScriptStep(makeArgs() as any, { jobPod: 'job-pod' })
-    ).rejects.toThrow('failed to merge temp dirs')
+    ).resolves.toBeUndefined()
   })
 
   it('copies files from pod after success', async () => {

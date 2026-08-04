@@ -36,9 +36,7 @@ export function prepareJobScript(userVolumeMounts: Mount[]): {
   containerPath: string
   runnerPath: string
 } {
-  let mountDirs = userVolumeMounts
-    .map(m => shlex.quote(m.targetVolumePath))
-    .join(' ')
+  let mountDirs = userVolumeMounts.map(m => m.targetVolumePath).join(' ')
 
   const content = `#!/bin/sh -l
 set -e
@@ -110,10 +108,10 @@ rm "$0" # remove script after running
 mv /__w/_temp/_github_home /github/home && \
 mv /__w/_temp/_github_workflow /github/workflow && \
 mv /__w/_temp/_runner_file_commands /github/file_commands || true && \
-mv ${shlex.quote('/__w/' + parts.join('/') + '/')} /github/workspace && \
+mv /__w/${parts.join('/')}/ /github/workspace && \
 cd /github/workspace && \
-exec ${environmentPrefix} ${shlex.quote(entryPoint)} ${
-    entryPointArgs?.length ? entryPointArgs.map(shlex.quote).join(' ') : ''
+exec ${environmentPrefix} ${entryPoint} ${
+    entryPointArgs?.length ? entryPointArgs.join(' ') : ''
   }
 `
   const filename = `${uuidv4()}.sh`
@@ -306,53 +304,58 @@ export function listDirAllCommand(dir: string): string {
   return `cd ${shlex.quote(dir)} && find . -type f -not -path '*/_runner_hook_responses*' -exec stat -c '%s %n' {} \\;`
 }
 
-// Safely turn an unknown thrown value into a diagnostic string without
-// throwing. The previous `JSON.stringify(err)` pattern crashed with
-// `TypeError: Converting circular structure to JSON` when err was a
-// @kubernetes/client-node HTTP error (its response embeds a
-// TLSSocket <-> HTTPParser cycle). The thrown TypeError shadowed the
-// original failure in every catch block that used it (issue #329).
+/**
+ * Safely extract a human-readable message from any throwable.
+ *
+ * Priority:
+ *  1. Error.message for native Error instances.
+ *  2. Kubernetes-style response.body.message + optional reason.
+ *  3. Top-level body.message when response is absent.
+ *  4. Top-level .message on any object.
+ *  5. String() of primitives and null/undefined.
+ *  6. JSON.stringify for plain objects (with circular-reference protection).
+ *  7. String() as last resort (catches objects whose toJSON throws).
+ */
 export function formatError(err: unknown): string {
-  if (err === null || err === undefined) {
-    return String(err)
-  }
-
-  // @kubernetes/client-node API errors expose the actual server message
-  // under response.body — prefer that when available.
-  const body =
-    (err as { response?: { body?: unknown } })?.response?.body ??
-    (err as { body?: unknown })?.body
-  if (body && typeof body === 'object') {
-    const msg = (body as { message?: unknown }).message
-    const reason = (body as { reason?: unknown }).reason
-    if (typeof msg === 'string') {
-      return typeof reason === 'string' && reason.length > 0
-        ? `${msg} (reason: ${reason})`
-        : msg
-    }
-  }
-
   if (err instanceof Error) {
     return err.message
   }
 
-  if (typeof err === 'object') {
-    // Non-Error objects sometimes carry a top-level message (axios-style
-    // errors, hand-rolled error-likes). Extract before the JSON.stringify
-    // branch so a circular ref doesn't reduce the diagnostic to
-    // "[object Object]".
-    const msg = (err as { message?: unknown }).message
-    if (typeof msg === 'string') {
+  if (typeof err === 'object' && err !== null) {
+    // Kubernetes client errors: { response: { body: { message, reason } } }
+    const k8sErr = err as Record<string, unknown>
+    const response = k8sErr.response as Record<string, unknown> | undefined
+    const body = response?.body as Record<string, unknown> | undefined
+    const bodyMessage = body?.message as string | undefined
+    const reason = body?.reason as string | undefined
+
+    if (bodyMessage !== undefined) {
+      return reason ? `${bodyMessage} (reason: ${reason})` : bodyMessage
+    }
+
+    // Fallback: top-level body.message (no response wrapper)
+    const topBody = k8sErr.body as Record<string, unknown> | undefined
+    const topBodyMessage = topBody?.message as string | undefined
+    if (topBodyMessage !== undefined) {
+      return topBodyMessage
+    }
+
+    // Plain object with a .message field
+    const msg = k8sErr.message as string | undefined
+    if (msg !== undefined) {
       return msg
     }
+
+    // Try JSON.stringify with circular-reference protection
     try {
       return JSON.stringify(err)
     } catch {
-      return String(err)
+      // JSON.stringify threw (circular or evil toJSON) — fall through
     }
   }
 
-  // Primitives serialise more readably via String() than JSON.stringify
-  // (which would quote strings and refuse to handle symbols).
+  // Primitives, null, undefined, or anything JSON.stringify couldn't handle
+  if (err === null) return 'null'
+  if (err === undefined) return 'undefined'
   return String(err)
 }

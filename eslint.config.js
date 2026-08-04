@@ -35,14 +35,7 @@ module.exports = [
       'no-shadow': 'off',
 
       // TypeScript ESLint rules
-      '@typescript-eslint/no-unused-vars': [
-        'error',
-        {
-          argsIgnorePattern: '^_',
-          caughtErrorsIgnorePattern: '^_',
-          varsIgnorePattern: '^_'
-        }
-      ],
+      '@typescript-eslint/no-unused-vars': 'error',
       '@typescript-eslint/explicit-member-accessibility': ['error', { accessibility: 'no-public' }],
       '@typescript-eslint/no-require-imports': 'error',
       '@typescript-eslint/array-type': 'error',
@@ -81,7 +74,7 @@ module.exports = [
       parserOptions: {
         ecmaVersion: 2018,
         sourceType: 'module',
-        project: ['./tsconfig.json', './packages/*/tsconfig.json']
+        project: ['./tsconfig.json', './packages/*/tsconfig.test.json']
       },
       globals: {
         ...globals.node,

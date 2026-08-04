@@ -21,7 +21,6 @@ import {
   CONTAINER_VOLUMES,
   DEFAULT_CONTAINER_ENTRY_POINT,
   DEFAULT_CONTAINER_ENTRY_POINT_ARGS,
-  formatError,
   generateContainerName,
   mergeContainerWithOptions,
   readExtensionFromFile,
@@ -164,11 +163,10 @@ export async function prepareJob(
     `Job pod created, waiting for it to come online ${createdPod?.metadata?.name}`
   )
 
-  const runnerWorkspaceEnv = process.env.RUNNER_WORKSPACE
-  if (!runnerWorkspaceEnv) {
-    throw new Error('RUNNER_WORKSPACE environment variable is not set')
+  if (!process.env.RUNNER_WORKSPACE) {
+    throw new Error('RUNNER_WORKSPACE is not set')
   }
-  const runnerWorkspace = dirname(runnerWorkspaceEnv)
+  const runnerWorkspace = dirname(process.env.RUNNER_WORKSPACE)
 
   let prepareScript: { containerPath: string; runnerPath: string } | undefined
   if (args.container?.userMountVolumes?.length) {
@@ -222,8 +220,10 @@ export async function prepareJob(
       JOB_CONTAINER_NAME
     )
   } catch (err) {
-    const message = formatError(err)
-    core.debug(`Failed to determine if the pod is alpine: ${message}`)
+    core.debug(
+      `Failed to determine if the pod is alpine: ${JSON.stringify(err)}`
+    )
+    const message = (err as any)?.response?.body?.message || err
     throw new Error(`failed to determine if the pod is alpine: ${message}`)
   }
   core.debug(`Setting isAlpine to ${isAlpine}`)

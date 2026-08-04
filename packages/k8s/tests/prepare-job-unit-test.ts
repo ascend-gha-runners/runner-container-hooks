@@ -83,7 +83,7 @@ describe('createContainerSpec', () => {
       'my-container'
     )
     expect(c.command).toEqual(['sh'])
-    // fixArgs splits 'sh -c echo hi' → shlex produces ['-c', 'echo', 'hi']
+    // fixArgs preserves 'sh -c' scripts as a single arg
     expect(c.args).toEqual(expect.arrayContaining(['-c']))
   })
 
