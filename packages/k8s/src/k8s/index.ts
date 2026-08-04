@@ -324,8 +324,14 @@ export async function execPodStepWithOutput(
   }
 
   const flushPending = () => {
-    if (pendingOut) { push(pendingOut); pendingOut = '' }
-    if (pendingErr) { push(pendingErr); pendingErr = '' }
+    if (pendingOut) {
+      push(pendingOut)
+      pendingOut = ''
+    }
+    if (pendingErr) {
+      push(pendingErr)
+      pendingErr = ''
+    }
   }
 
   const capture = new stream.Writable({
@@ -574,11 +580,11 @@ export async function execCpToPod(
         ])
 
       const { hash: got, lines: gotLines } =
-        await execCalculateOutputHashSorted(
-          podName,
-          JOB_CONTAINER_NAME,
-          ['sh', '-c', listDirAllCommand(containerPath)]
-        )
+        await execCalculateOutputHashSorted(podName, JOB_CONTAINER_NAME, [
+          'sh',
+          '-c',
+          listDirAllCommand(containerPath)
+        ])
 
       if (got !== want) {
         core.debug(
@@ -593,8 +599,12 @@ export async function execCpToPod(
         const gotMap = new Map(
           gotLines.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
         )
-        const onlyInWant = wantLines.filter(l => !gotMap.has(l.replace(/^\d+ /, '')))
-        const onlyInGot = gotLines.filter(l => !wantMap.has(l.replace(/^\d+ /, '')))
+        const onlyInWant = wantLines.filter(
+          l => !gotMap.has(l.replace(/^\d+ /, ''))
+        )
+        const onlyInGot = gotLines.filter(
+          l => !wantMap.has(l.replace(/^\d+ /, ''))
+        )
         const sizeDiff = wantLines
           .filter(l => {
             const name = l.replace(/^\d+ /, '')
@@ -702,11 +712,11 @@ export async function execCpFromPod(
   for (let i = 0; i < attempts; i++) {
     try {
       const { hash: want, lines: wantLines } =
-        await execCalculateOutputHashSorted(
-          podName,
-          JOB_CONTAINER_NAME,
-          ['sh', '-c', listDirAllCommand(containerPath)]
-        )
+        await execCalculateOutputHashSorted(podName, JOB_CONTAINER_NAME, [
+          'sh',
+          '-c',
+          listDirAllCommand(containerPath)
+        ])
 
       const { hash: got, lines: gotLines } =
         await localCalculateOutputHashSorted([
@@ -728,8 +738,12 @@ export async function execCpFromPod(
         const gotMap = new Map(
           gotLines.map(l => [l.replace(/^\d+ /, ''), l.split(' ')[0]])
         )
-        const onlyInWant = wantLines.filter(l => !gotMap.has(l.replace(/^\d+ /, '')))
-        const onlyInGot = gotLines.filter(l => !wantMap.has(l.replace(/^\d+ /, '')))
+        const onlyInWant = wantLines.filter(
+          l => !gotMap.has(l.replace(/^\d+ /, ''))
+        )
+        const onlyInGot = gotLines.filter(
+          l => !wantMap.has(l.replace(/^\d+ /, ''))
+        )
         const sizeDiff = wantLines
           .filter(l => {
             const name = l.replace(/^\d+ /, '')
@@ -862,21 +876,81 @@ export async function pruneSecrets(): Promise<void> {
 }
 
 export const UNRECOVERABLE_WAITING_REASONS = new Set([
-  // k8s has already retried image pull multiple times with exponential backoff.
-  // ErrImagePull is excluded: it fires on the first failure (could be a transient
-  // TLS timeout or network blip) and k8s will naturally promote it to
-  // ImagePullBackOff after a moment. Fast-failing on ErrImagePull would kill
-  // jobs that would have succeeded on the next pull attempt.
-  'ImagePullBackOff',
   // Image name is syntactically invalid — cannot self-heal without a config fix.
   'InvalidImageName',
   // Container spec is invalid (bad env vars, resource limits, securityContext) —
   // cannot self-heal without a config fix.
-  'CreateContainerConfigError',
+  'CreateContainerConfigError'
   // CreateContainerError is excluded: it is sometimes emitted transiently by the
   // container runtime (e.g. during a node-level runtime restart). It can
   // self-resolve on the next kubelet retry cycle.
+  //
+  // ImagePullBackOff and ErrImagePull are also excluded from this set. k8s
+  // promotes to ImagePullBackOff from the second pull attempt, so fast-failing
+  // on it would kill jobs during a transient network outage. They are instead
+  // handled by the image-pull grace window in waitForPodPhases (see
+  // IMAGE_PULL_WAITING_REASONS / evaluateImagePullFailures): the hook waits a
+  // bounded grace period for the pull to self-heal and only then fails, unless
+  // the waiting message positively identifies a permanent cause.
 ])
+
+// Waiting reasons that indicate the container image could not be pulled yet.
+// Unlike UNRECOVERABLE_WAITING_REASONS these are NOT failed instantly: a pull
+// can be stuck transiently (DNS/TLS/registry outage) and self-heal on a later
+// kubelet retry. waitForPodPhases gives them a bounded grace period (see
+// getImagePullGraceMs / evaluateImagePullFailures) and only fails once that
+// grace is exceeded without recovery — or immediately when the waiting message
+// positively identifies a permanent cause (see PERMANENT_IMAGE_PULL_PATTERNS).
+export const IMAGE_PULL_WAITING_REASONS = new Set([
+  'ImagePullBackOff',
+  'ErrImagePull'
+])
+
+// Waiting messages that POSITIVELY IDENTIFY a permanent image-pull failure that
+// will not self-heal even if the network recovers (wrong image/tag, missing
+// registry repository, invalid credentials). When one of these matches,
+// fast-fail immediately, skipping the grace period. Anything else (network /
+// TLS / timeout errors) is treated as transient and given the grace window.
+//
+// Permanent examples (WILL fast-fail immediately):
+//   "pull access denied for nope/nonexistent, repository does not exist or may require 'docker login'"
+//   "manifest for nope:latest not found"
+//   "unauthorized: authentication required"
+//
+// Transient examples (grace window applies):
+//   "dial tcp 10.0.0.1:443: connect: connection refused"
+//   "TLS handshake timeout"
+//   "failed to resolve reference: ... i/o timeout"
+export const PERMANENT_IMAGE_PULL_PATTERNS: readonly RegExp[] = [
+  /manifest .*not found/i,
+  /pull access denied/i,
+  /unauthorized/i,
+  /repository does not exist/i,
+  /image not known/i,
+  /denied: requested access/i,
+  /no such image/i
+]
+
+export const DEFAULT_IMAGE_PULL_GRACE_MS = 5 * 60 * 1000 // 5 min
+
+// How long an image-pull failure may persist before the hook gives up. Reads
+// ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS (default 300). A value of 0
+// restores the old behavior: fail as soon as the pull failure is observed.
+export function getImagePullGraceMs(): number {
+  const envGraceSeconds =
+    process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS']
+  if (!envGraceSeconds) {
+    return DEFAULT_IMAGE_PULL_GRACE_MS
+  }
+  const graceSeconds = parseInt(envGraceSeconds, 10)
+  if (Number.isNaN(graceSeconds) || graceSeconds < 0) {
+    core.warning(
+      `Image pull grace is invalid ("${envGraceSeconds}"): use an int >= 0, falling back to ${DEFAULT_IMAGE_PULL_GRACE_MS / 1000}s`
+    )
+    return DEFAULT_IMAGE_PULL_GRACE_MS
+  }
+  return graceSeconds * 1000
+}
 
 // Pod *event* reasons (from the event stream, not container status) that
 // indicate a permanent failure the pod will never recover from on its own.
@@ -930,7 +1004,7 @@ export const PERMANENT_SCHEDULING_PATTERNS: readonly RegExp[] = [
   // PVC referenced in the pod spec does not exist in the namespace. The
   // scheduler refuses to place the pod until the PVC is created. The workflow
   // job spec is wrong — it won't self-resolve.
-  /persistentvolumeclaim "[^"]+" not found/i,
+  /persistentvolumeclaim "[^"]+" not found/i
 ]
 
 export const UNRECOVERABLE_TERMINATED_REASONS = new Set([
@@ -981,7 +1055,8 @@ export function getUnrecoverableEventReasons(): Set<string> {
 }
 
 export function getUnrecoverableTerminatedReasons(): Set<string> {
-  const extra = process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_TERMINATED_REASONS']
+  const extra =
+    process.env['ACTIONS_RUNNER_K8S_UNRECOVERABLE_TERMINATED_REASONS']
   if (!extra) {
     return UNRECOVERABLE_TERMINATED_REASONS
   }
@@ -1001,7 +1076,9 @@ export function getUnrecoverableTerminatedReasons(): Set<string> {
 //   - absent/empty messages   → unknown, assume transient
 //   - resource shortages      → Insufficient cpu/memory/gpu/etc.
 //   - any unrecognised format → unknown, assume transient
-export function isPermanentSchedulingFailure(message: string | undefined): boolean {
+export function isPermanentSchedulingFailure(
+  message: string | undefined
+): boolean {
   if (!message) return false
   return getPermanentSchedulingPatterns().some(p => p.test(message))
 }
@@ -1046,7 +1123,15 @@ function getWaitingReasonHint(reason: string): string {
         `    - Image name and tag are correct and exist in the registry`,
         `    - If private registry: imagePullSecret is configured and credentials are valid`,
         `    - Network connectivity from the node to the registry (DNS, firewall, proxy, TLS)`,
-        `    Run: kubectl describe pod <pod> | grep -A10 "Events"`,
+        `    Run: kubectl describe pod <pod> | grep -A10 "Events"`
+      ].join('\n')
+    case 'ErrImagePull':
+      return [
+        `  → Image pull failed and did not recover within the grace period. Check:`,
+        `    - Image name and tag are correct and exist in the registry`,
+        `    - If private registry: imagePullSecret is configured and credentials are valid`,
+        `    - Network connectivity from the node to the registry (DNS, firewall, proxy, TLS)`,
+        `    Run: kubectl describe pod <pod> | grep -A10 "Events"`
       ].join('\n')
     case 'InvalidImageName':
       return `  → Image name is malformed. Check the workflow/job container image configuration.`
@@ -1076,7 +1161,64 @@ export function getContainerErrors(pod: k8s.V1Pod): string[] {
   return errors
 }
 
-export function getTerminatedReasonHint(reason: string, exitCode: number | undefined): string {
+// Tracks, per container, the first time it was observed in an image-pull-failure
+// waiting state (ImagePullBackOff / ErrImagePull) and reports an error for any
+// container whose failure has either (a) persisted continuously beyond graceMs,
+// or (b) a waiting message matching PERMANENT_IMAGE_PULL_PATTERNS. Containers
+// that recover (leave the image-pull-failure state) have their tracking entry
+// cleared, so a later pull failure starts a fresh grace window. `firstSeen` is
+// mutated in place and must be owned by the caller (one per waitForPodPhases
+// loop). `now` is injected for testability.
+export function evaluateImagePullFailures(
+  pod: k8s.V1Pod,
+  firstSeen: Map<string, number>,
+  graceMs: number,
+  now: number
+): string[] {
+  const allStatuses = [
+    ...(pod.status?.initContainerStatuses ?? []),
+    ...(pod.status?.containerStatuses ?? [])
+  ]
+  const errors: string[] = []
+  const currentlyFailing = new Set<string>()
+  for (const cs of allStatuses) {
+    const waiting = cs.state?.waiting
+    if (!waiting?.reason || !IMAGE_PULL_WAITING_REASONS.has(waiting.reason)) {
+      continue
+    }
+    currentlyFailing.add(cs.name)
+    if (!firstSeen.has(cs.name)) {
+      firstSeen.set(cs.name, now)
+    }
+    const startedAt = firstSeen.get(cs.name) as number
+    const message = waiting.message ?? ''
+    const permanent = PERMANENT_IMAGE_PULL_PATTERNS.some(p => p.test(message))
+    const elapsed = now - startedAt
+    if (!permanent && elapsed < graceMs) {
+      continue
+    }
+    const qualifier = permanent
+      ? '(permanent image error)'
+      : `(failed for ${Math.round(elapsed / 1000)}s, exceeding the ${Math.round(graceMs / 1000)}s grace period)`
+    const reason = `  ✗ container "${cs.name}": ${waiting.reason} ${qualifier}`
+    const detail = message ? `\n    ${message}` : ''
+    const hint = `\n${getWaitingReasonHint(waiting.reason)}`
+    errors.push(`${reason}${detail}${hint}`)
+  }
+  // Drop tracking for containers no longer in an image-pull-failure state so a
+  // later failure gets a fresh grace window.
+  for (const name of Array.from(firstSeen.keys())) {
+    if (!currentlyFailing.has(name)) {
+      firstSeen.delete(name)
+    }
+  }
+  return errors
+}
+
+export function getTerminatedReasonHint(
+  reason: string,
+  exitCode: number | undefined
+): string {
   if (reason === 'OOMKilled') {
     return `  → Container exceeded its memory limit and was killed by the OOM killer.\n    Increase the memory limit in the job spec or reduce memory usage in the script.`
   }
@@ -1126,21 +1268,21 @@ function getEventReasonHint(reason: string): string {
         `  → A volume could not be mounted. Check:`,
         `    - PVC is bound (kubectl get pvc)`,
         `    - Secret/ConfigMap referenced in the volume exists`,
-        `    - hostPath directories exist on the scheduled node`,
+        `    - hostPath directories exist on the scheduled node`
       ].join('\n')
     case 'FailedBinding':
       return [
         `  → A PVC could not be bound to a PV. Check:`,
         `    - StorageClass exists and has a provisioner`,
         `    - Sufficient capacity is available`,
-        `    - Access mode (ReadWriteOnce/ReadWriteMany) matches available PVs`,
+        `    - Access mode (ReadWriteOnce/ReadWriteMany) matches available PVs`
       ].join('\n')
     case 'FailedScheduling':
       return [
         `  → Pod cannot be scheduled due to a permanent configuration error. Check:`,
         `    - nodeSelector / nodeAffinity labels match at least one node`,
         `    - All tolerations are present for node taints`,
-        `    - PVCs referenced in the pod spec exist in the namespace`,
+        `    - PVCs referenced in the pod spec exist in the namespace`
       ].join('\n')
     default:
       return `  → Check pod events with: kubectl describe pod <pod>`
@@ -1180,13 +1322,20 @@ export async function getPodEventErrors(podName: string): Promise<string[]> {
   const errors: string[] = []
   const seenReasons = new Set<string>()
   for (const e of items) {
-    if (e.type !== 'Warning' || !e.reason || !unrecoverableReasons.has(e.reason)) {
+    if (
+      e.type !== 'Warning' ||
+      !e.reason ||
+      !unrecoverableReasons.has(e.reason)
+    ) {
       continue
     }
     // FailedScheduling: only fast-fail when the message positively matches a
     // known-permanent config error. Resource shortages and unknown messages
     // are treated as transient — let the pod keep queuing.
-    if (e.reason === 'FailedScheduling' && !isPermanentSchedulingFailure(e.message)) {
+    if (
+      e.reason === 'FailedScheduling' &&
+      !isPermanentSchedulingFailure(e.message)
+    ) {
       core.debug(
         `[fast-fail] Skipping FailedScheduling (not a recognised permanent error): ${
           e.message ?? '(no message)'
@@ -1256,11 +1405,16 @@ export async function describePodFailure(podName: string): Promise<string> {
   for (const cs of allStatuses) {
     const waiting = cs.state?.waiting
     if (waiting?.reason) {
-      // Skip reasons already surfaced by getContainerErrors() in the caller's
-      // first line to avoid printing the same error twice.
-      if (!unrecoverableReasons.has(waiting.reason)) {
+      // Skip reasons already surfaced by getContainerErrors() or the image-pull
+      // grace fast-fail to avoid printing the same error twice.
+      if (
+        !unrecoverableReasons.has(waiting.reason) &&
+        !IMAGE_PULL_WAITING_REASONS.has(waiting.reason)
+      ) {
         const msg = waiting.message ? `\n    ${waiting.message}` : ''
-        containerLines.push(`  ✗ container "${cs.name}" waiting: ${waiting.reason}${msg}`)
+        containerLines.push(
+          `  ✗ container "${cs.name}" waiting: ${waiting.reason}${msg}`
+        )
       }
     }
     const terminated = cs.state?.terminated
@@ -1363,9 +1517,17 @@ export async function checkUnrecoverableErrors(
   // a few extra seconds to propagate, so always run the check. Deduplicate
   // against events so the same FailedScheduling isn't printed twice.
   const conditionErrors = getPodConditionErrors(pod).filter(
-    c => !eventErrors.some(e => e.includes('FailedScheduling') && c.includes('Unschedulable'))
+    c =>
+      !eventErrors.some(
+        e => e.includes('FailedScheduling') && c.includes('Unschedulable')
+      )
   )
-  return [...containerErrors, ...terminatedErrors, ...eventErrors, ...conditionErrors]
+  return [
+    ...containerErrors,
+    ...terminatedErrors,
+    ...eventErrors,
+    ...conditionErrors
+  ]
 }
 
 export async function waitForPodPhases(
@@ -1375,6 +1537,10 @@ export async function waitForPodPhases(
   maxTimeSeconds = DEFAULT_WAIT_FOR_POD_TIME_SECONDS
 ): Promise<void> {
   const backOffManager = new BackOffManager(maxTimeSeconds)
+  // Per-container first-observation timestamps for the image-pull grace window
+  // (see evaluateImagePullFailures). Mutated in place across poll iterations.
+  const imagePullFirstSeen = new Map<string, number>()
+  const imagePullGraceMs = getImagePullGraceMs()
   let phase: PodPhase = PodPhase.UNKNOWN
   while (true) {
     let pod: k8s.V1Pod
@@ -1423,14 +1589,22 @@ export async function waitForPodPhases(
       )
     }
 
-    // Still in a back-off phase, but a deterministic unrecoverable error
-    // was detected (container / event / condition). Fail fast with
-    // diagnostics instead of waiting out the full timeout.
+    // Still in a back-off phase, but a deterministic unrecoverable error was
+    // detected (container / event / condition) OR an image-pull failure has
+    // persisted past its grace period / matched a permanent pattern. Fail fast
+    // with diagnostics instead of waiting out the full timeout.
+    const imagePullErrors = evaluateImagePullFailures(
+      pod,
+      imagePullFirstSeen,
+      imagePullGraceMs,
+      Date.now()
+    )
     const errors = await checkUnrecoverableErrors(pod, podName)
-    if (errors.length > 0) {
+    const allErrors = [...imagePullErrors, ...errors]
+    if (allErrors.length > 0) {
       const details = await describePodFailure(podName)
       throw new Error(
-        `Pod ${podName} has unrecoverable errors:\n${errors.join('\n')}\n${'-'.repeat(60)}\n${details}`
+        `Pod ${podName} has unrecoverable errors:\n${allErrors.join('\n')}\n${'-'.repeat(60)}\n${details}`
       )
     }
 
