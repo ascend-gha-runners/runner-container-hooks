@@ -862,21 +862,81 @@ export async function pruneSecrets(): Promise<void> {
 }
 
 export const UNRECOVERABLE_WAITING_REASONS = new Set([
-  // k8s has already retried image pull multiple times with exponential backoff.
-  // ErrImagePull is excluded: it fires on the first failure (could be a transient
-  // TLS timeout or network blip) and k8s will naturally promote it to
-  // ImagePullBackOff after a moment. Fast-failing on ErrImagePull would kill
-  // jobs that would have succeeded on the next pull attempt.
-  'ImagePullBackOff',
   // Image name is syntactically invalid — cannot self-heal without a config fix.
   'InvalidImageName',
   // Container spec is invalid (bad env vars, resource limits, securityContext) —
   // cannot self-heal without a config fix.
-  'CreateContainerConfigError',
+  'CreateContainerConfigError'
   // CreateContainerError is excluded: it is sometimes emitted transiently by the
   // container runtime (e.g. during a node-level runtime restart). It can
   // self-resolve on the next kubelet retry cycle.
+  //
+  // ImagePullBackOff and ErrImagePull are also excluded from this set. k8s
+  // promotes to ImagePullBackOff from the second pull attempt, so fast-failing
+  // on it would kill jobs during a transient network outage. They are instead
+  // handled by the image-pull grace window in waitForPodPhases (see
+  // IMAGE_PULL_WAITING_REASONS / evaluateImagePullFailures): the hook waits a
+  // bounded grace period for the pull to self-heal and only then fails, unless
+  // the waiting message positively identifies a permanent cause.
 ])
+
+// Waiting reasons that indicate the container image could not be pulled yet.
+// Unlike UNRECOVERABLE_WAITING_REASONS these are NOT failed instantly: a pull
+// can be stuck transiently (DNS/TLS/registry outage) and self-heal on a later
+// kubelet retry. waitForPodPhases gives them a bounded grace period (see
+// getImagePullGraceMs / evaluateImagePullFailures) and only fails once that
+// grace is exceeded without recovery — or immediately when the waiting message
+// positively identifies a permanent cause (see PERMANENT_IMAGE_PULL_PATTERNS).
+export const IMAGE_PULL_WAITING_REASONS = new Set([
+  'ImagePullBackOff',
+  'ErrImagePull'
+])
+
+// Waiting messages that POSITIVELY IDENTIFY a permanent image-pull failure that
+// will not self-heal even if the network recovers (wrong image/tag, missing
+// registry repository, invalid credentials). When one of these matches,
+// fast-fail immediately, skipping the grace period. Anything else (network /
+// TLS / timeout errors) is treated as transient and given the grace window.
+//
+// Permanent examples (WILL fast-fail immediately):
+//   "pull access denied for nope/nonexistent, repository does not exist or may require 'docker login'"
+//   "manifest for nope:latest not found"
+//   "unauthorized: authentication required"
+//
+// Transient examples (grace window applies):
+//   "dial tcp 10.0.0.1:443: connect: connection refused"
+//   "TLS handshake timeout"
+//   "failed to resolve reference: ... i/o timeout"
+export const PERMANENT_IMAGE_PULL_PATTERNS: readonly RegExp[] = [
+  /manifest .*not found/i,
+  /pull access denied/i,
+  /unauthorized/i,
+  /repository does not exist/i,
+  /image not known/i,
+  /denied: requested access/i,
+  /no such image/i
+]
+
+export const DEFAULT_IMAGE_PULL_GRACE_MS = 5 * 60 * 1000 // 5 min
+
+// How long an image-pull failure may persist before the hook gives up. Reads
+// ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS (default 300). A value of 0
+// restores the old behavior: fail as soon as the pull failure is observed.
+export function getImagePullGraceMs(): number {
+  const envGraceSeconds =
+    process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS']
+  if (!envGraceSeconds) {
+    return DEFAULT_IMAGE_PULL_GRACE_MS
+  }
+  const graceSeconds = parseInt(envGraceSeconds, 10)
+  if (Number.isNaN(graceSeconds) || graceSeconds < 0) {
+    core.warning(
+      `Image pull grace is invalid ("${envGraceSeconds}"): use an int >= 0, falling back to ${DEFAULT_IMAGE_PULL_GRACE_MS / 1000}s`
+    )
+    return DEFAULT_IMAGE_PULL_GRACE_MS
+  }
+  return graceSeconds * 1000
+}
 
 // Pod *event* reasons (from the event stream, not container status) that
 // indicate a permanent failure the pod will never recover from on its own.
@@ -1046,7 +1106,15 @@ function getWaitingReasonHint(reason: string): string {
         `    - Image name and tag are correct and exist in the registry`,
         `    - If private registry: imagePullSecret is configured and credentials are valid`,
         `    - Network connectivity from the node to the registry (DNS, firewall, proxy, TLS)`,
-        `    Run: kubectl describe pod <pod> | grep -A10 "Events"`,
+        `    Run: kubectl describe pod <pod> | grep -A10 "Events"`
+      ].join('\n')
+    case 'ErrImagePull':
+      return [
+        `  → Image pull failed and did not recover within the grace period. Check:`,
+        `    - Image name and tag are correct and exist in the registry`,
+        `    - If private registry: imagePullSecret is configured and credentials are valid`,
+        `    - Network connectivity from the node to the registry (DNS, firewall, proxy, TLS)`,
+        `    Run: kubectl describe pod <pod> | grep -A10 "Events"`
       ].join('\n')
     case 'InvalidImageName':
       return `  → Image name is malformed. Check the workflow/job container image configuration.`
@@ -1071,6 +1139,60 @@ export function getContainerErrors(pod: k8s.V1Pod): string[] {
       const detail = waiting.message ? `\n    ${waiting.message}` : ''
       const hint = `\n${getWaitingReasonHint(waiting.reason)}`
       errors.push(`${reason}${detail}${hint}`)
+    }
+  }
+  return errors
+}
+
+// Tracks, per container, the first time it was observed in an image-pull-failure
+// waiting state (ImagePullBackOff / ErrImagePull) and reports an error for any
+// container whose failure has either (a) persisted continuously beyond graceMs,
+// or (b) a waiting message matching PERMANENT_IMAGE_PULL_PATTERNS. Containers
+// that recover (leave the image-pull-failure state) have their tracking entry
+// cleared, so a later pull failure starts a fresh grace window. `firstSeen` is
+// mutated in place and must be owned by the caller (one per waitForPodPhases
+// loop). `now` is injected for testability.
+export function evaluateImagePullFailures(
+  pod: k8s.V1Pod,
+  firstSeen: Map<string, number>,
+  graceMs: number,
+  now: number
+): string[] {
+  const allStatuses = [
+    ...(pod.status?.initContainerStatuses ?? []),
+    ...(pod.status?.containerStatuses ?? [])
+  ]
+  const errors: string[] = []
+  const currentlyFailing = new Set<string>()
+  for (const cs of allStatuses) {
+    const waiting = cs.state?.waiting
+    if (!waiting?.reason || !IMAGE_PULL_WAITING_REASONS.has(waiting.reason)) {
+      continue
+    }
+    currentlyFailing.add(cs.name)
+    if (!firstSeen.has(cs.name)) {
+      firstSeen.set(cs.name, now)
+    }
+    const startedAt = firstSeen.get(cs.name) as number
+    const message = waiting.message ?? ''
+    const permanent = PERMANENT_IMAGE_PULL_PATTERNS.some(p => p.test(message))
+    const elapsed = now - startedAt
+    if (!permanent && elapsed < graceMs) {
+      continue
+    }
+    const qualifier = permanent
+      ? '(permanent image error)'
+      : `(failed for ${Math.round(elapsed / 1000)}s, exceeding the ${Math.round(graceMs / 1000)}s grace period)`
+    const reason = `  ✗ container "${cs.name}": ${waiting.reason} ${qualifier}`
+    const detail = message ? `\n    ${message}` : ''
+    const hint = `\n${getWaitingReasonHint(waiting.reason)}`
+    errors.push(`${reason}${detail}${hint}`)
+  }
+  // Drop tracking for containers no longer in an image-pull-failure state so a
+  // later failure gets a fresh grace window.
+  for (const name of Array.from(firstSeen.keys())) {
+    if (!currentlyFailing.has(name)) {
+      firstSeen.delete(name)
     }
   }
   return errors
@@ -1256,9 +1378,12 @@ export async function describePodFailure(podName: string): Promise<string> {
   for (const cs of allStatuses) {
     const waiting = cs.state?.waiting
     if (waiting?.reason) {
-      // Skip reasons already surfaced by getContainerErrors() in the caller's
-      // first line to avoid printing the same error twice.
-      if (!unrecoverableReasons.has(waiting.reason)) {
+      // Skip reasons already surfaced by getContainerErrors() or the image-pull
+      // grace fast-fail to avoid printing the same error twice.
+      if (
+        !unrecoverableReasons.has(waiting.reason) &&
+        !IMAGE_PULL_WAITING_REASONS.has(waiting.reason)
+      ) {
         const msg = waiting.message ? `\n    ${waiting.message}` : ''
         containerLines.push(`  ✗ container "${cs.name}" waiting: ${waiting.reason}${msg}`)
       }
@@ -1353,7 +1478,9 @@ export async function checkUnrecoverableErrors(
   pod: k8s.V1Pod,
   podName: string
 ): Promise<string[]> {
-  // Deterministic terminal errors on a container (e.g. ImagePullBackOff).
+  // Deterministic terminal errors on a container (InvalidImageName, ...).
+  // ImagePullBackOff/ErrImagePull are handled by the grace window instead
+  // (see evaluateImagePullFailures in waitForPodPhases).
   const containerErrors = getContainerErrors(pod)
   // Terminated container errors (e.g. OOMKilled, non-zero exit) with hints.
   const terminatedErrors = getContainerTerminatedErrors(pod)
@@ -1375,6 +1502,10 @@ export async function waitForPodPhases(
   maxTimeSeconds = DEFAULT_WAIT_FOR_POD_TIME_SECONDS
 ): Promise<void> {
   const backOffManager = new BackOffManager(maxTimeSeconds)
+  // Per-container first-observation timestamps for the image-pull grace window
+  // (see evaluateImagePullFailures). Mutated in place across poll iterations.
+  const imagePullFirstSeen = new Map<string, number>()
+  const imagePullGraceMs = getImagePullGraceMs()
   let phase: PodPhase = PodPhase.UNKNOWN
   while (true) {
     let pod: k8s.V1Pod
@@ -1423,14 +1554,22 @@ export async function waitForPodPhases(
       )
     }
 
-    // Still in a back-off phase, but a deterministic unrecoverable error
-    // was detected (container / event / condition). Fail fast with
-    // diagnostics instead of waiting out the full timeout.
+    // Still in a back-off phase, but a deterministic unrecoverable error was
+    // detected (container / event / condition) OR an image-pull failure has
+    // persisted past its grace period / matched a permanent pattern. Fail fast
+    // with diagnostics instead of waiting out the full timeout.
+    const imagePullErrors = evaluateImagePullFailures(
+      pod,
+      imagePullFirstSeen,
+      imagePullGraceMs,
+      Date.now()
+    )
     const errors = await checkUnrecoverableErrors(pod, podName)
-    if (errors.length > 0) {
+    const allErrors = [...imagePullErrors, ...errors]
+    if (allErrors.length > 0) {
       const details = await describePodFailure(podName)
       throw new Error(
-        `Pod ${podName} has unrecoverable errors:\n${errors.join('\n')}\n${'-'.repeat(60)}\n${details}`
+        `Pod ${podName} has unrecoverable errors:\n${allErrors.join('\n')}\n${'-'.repeat(60)}\n${details}`
       )
     }
 

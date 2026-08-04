@@ -47,10 +47,16 @@ rules:
     - `ACTIONS_RUNNER_K8S_UNRECOVERABLE_WAITING_REASONS` — comma-separated list of
       extra container `waiting` reasons that should be treated as deterministic
       terminal failures (fail fast instead of waiting for the timeout). These are
-      *added* to the built-ins (`ImagePullBackOff`, `ErrImagePull`,
-      `InvalidImageName`, `CreateContainerConfigError`, `CreateContainerError`);
+      *added* to the built-ins (`InvalidImageName`, `CreateContainerConfigError`);
       the built-ins can never be removed. Use with care — only list reasons that
       are truly unrecoverable for your workloads (e.g. `CrashLoopBackOff`).
+    - `ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS` — how long `ImagePullBackOff`
+      / `ErrImagePull` may persist before the hook fails the job (default `300`,
+      i.e. 5 minutes). The pod is given this window to self-heal, e.g. during a
+      transient network outage. Permanent image errors (bad tag, invalid
+      credentials, missing repository) are detected from the waiting message and
+      still fail immediately. Set to `0` to fail as soon as the pull failure is
+      observed (the previous behavior).
 
 
 ## Limitations

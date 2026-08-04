@@ -1,8 +1,10 @@
 import * as k8s from '@kubernetes/client-node'
 import {
   describePodFailure,
+  evaluateImagePullFailures,
   getContainerErrors,
   getContainerTerminatedErrors,
+  getImagePullGraceMs,
   getPodEventErrors,
   getUnrecoverableEventReasons,
   getUnrecoverableTerminatedReasons,
@@ -125,7 +127,10 @@ describe('getContainerErrors', () => {
     }
   })
 
-  it('includes retry-history and network hint for ImagePullBackOff', () => {
+  it('does not fast-fail on ImagePullBackOff (handled by the grace period)', () => {
+    // ImagePullBackOff is NOT an immediate unrecoverable reason: a transient
+    // network outage can self-heal. waitForPodPhases gives it a bounded grace
+    // period (see evaluateImagePullFailures) before failing.
     const pod = buildPod(PodPhase.PENDING, {
       containerStatuses: [
         waitingContainer(
@@ -135,15 +140,10 @@ describe('getContainerErrors', () => {
         )
       ]
     })
-    const errors = getContainerErrors(pod)
-    expect(errors).toHaveLength(1)
-    expect(errors[0]).toContain('  ✗ container "job": ImagePullBackOff')
-    expect(errors[0]).toContain('Back-off pulling image "does-not-exist:latest"')
-    expect(errors[0]).toContain('registry')
-    expect(errors[0]).toContain('TLS')
+    expect(getContainerErrors(pod)).toEqual([])
   })
 
-  it('does not fast-fail on ErrImagePull (treated as transient first-attempt)', () => {
+  it('does not fast-fail on ErrImagePull (treated as transient, grace period applies)', () => {
     // ErrImagePull fires on the first pull failure (could be a TLS timeout).
     // k8s will retry and promote to ImagePullBackOff if it keeps failing.
     const pod = buildPod(PodPhase.PENDING, {
@@ -161,12 +161,16 @@ describe('getContainerErrors', () => {
 
   it('inspects init containers as well as regular containers', () => {
     const pod = buildPod(PodPhase.PENDING, {
-      initContainerStatuses: [waitingContainer('init', 'ImagePullBackOff')],
+      initContainerStatuses: [
+        waitingContainer('init', 'CreateContainerConfigError')
+      ],
       containerStatuses: [waitingContainer('job', 'InvalidImageName')]
     })
     const errors = getContainerErrors(pod)
     expect(errors).toHaveLength(2)
-    expect(errors[0]).toContain('  ✗ container "init": ImagePullBackOff')
+    expect(errors[0]).toContain(
+      '  ✗ container "init": CreateContainerConfigError'
+    )
     expect(errors[1]).toContain('  ✗ container "job": InvalidImageName')
   })
 
@@ -180,6 +184,155 @@ describe('getContainerErrors', () => {
     const errors = getContainerErrors(pod)
     expect(errors).toHaveLength(1)
     expect(errors[0]).toContain('  ✗ container "bad": InvalidImageName')
+  })
+})
+
+describe('getImagePullGraceMs', () => {
+  afterEach(() => {
+    delete process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS']
+  })
+
+  it('returns the default 5 minutes when the env var is unset', () => {
+    expect(getImagePullGraceMs()).toBe(5 * 60 * 1000)
+  })
+
+  it('reads ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS in seconds', () => {
+    process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS'] = '120'
+    expect(getImagePullGraceMs()).toBe(120 * 1000)
+  })
+
+  it('returns 0 when grace is set to 0 (immediate fail, old behavior)', () => {
+    process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS'] = '0'
+    expect(getImagePullGraceMs()).toBe(0)
+  })
+
+  it('falls back to the default for invalid or negative values', () => {
+    process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS'] = 'abc'
+    expect(getImagePullGraceMs()).toBe(5 * 60 * 1000)
+    process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS'] = '-5'
+    expect(getImagePullGraceMs()).toBe(5 * 60 * 1000)
+  })
+})
+
+describe('evaluateImagePullFailures', () => {
+  it('returns no errors when there are no image-pull failures', () => {
+    const firstSeen = new Map<string, number>()
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'ContainerCreating')]
+    })
+    expect(evaluateImagePullFailures(pod, firstSeen, 300000, 1000)).toEqual([])
+    expect(firstSeen.size).toBe(0)
+  })
+
+  it('records first observation and stays silent within the grace period', () => {
+    const firstSeen = new Map<string, number>()
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [
+        waitingContainer(
+          'job',
+          'ImagePullBackOff',
+          'Back-off pulling image "nope:latest"'
+        )
+      ]
+    })
+    expect(evaluateImagePullFailures(pod, firstSeen, 300000, 1000)).toEqual([])
+    expect(firstSeen.get('job')).toBe(1000)
+    // Still within grace on a later poll.
+    expect(
+      evaluateImagePullFailures(pod, firstSeen, 300000, 1000 + 299999)
+    ).toEqual([])
+  })
+
+  it('errors for ImagePullBackOff and ErrImagePull once the grace period expires', () => {
+    const firstSeen = new Map<string, number>()
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [
+        waitingContainer('job', 'ImagePullBackOff'),
+        waitingContainer('svc', 'ErrImagePull', 'TLS handshake timeout')
+      ]
+    })
+    const now = 1000
+    evaluateImagePullFailures(pod, firstSeen, 300000, now)
+    const errors = evaluateImagePullFailures(
+      pod,
+      firstSeen,
+      300000,
+      now + 300000
+    )
+    expect(errors).toHaveLength(2)
+    expect(errors[0]).toContain('  ✗ container "job": ImagePullBackOff')
+    expect(errors[0]).toContain('exceeding the 300s grace period')
+    expect(errors[0]).toContain('→')
+    expect(errors[1]).toContain('  ✗ container "svc": ErrImagePull')
+  })
+
+  it('fails immediately on a permanent image-pull error message', () => {
+    const firstSeen = new Map<string, number>()
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [
+        waitingContainer(
+          'job',
+          'ImagePullBackOff',
+          'pull access denied for nope/nonexistent, repository does not exist or may require docker login'
+        )
+      ]
+    })
+    const errors = evaluateImagePullFailures(pod, firstSeen, 300000, 1000)
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('  ✗ container "job": ImagePullBackOff')
+    expect(errors[0]).toContain('(permanent image error)')
+  })
+
+  it('does not reset the grace window while the failure persists', () => {
+    const firstSeen = new Map<string, number>()
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'ImagePullBackOff')]
+    })
+    evaluateImagePullFailures(pod, firstSeen, 300000, 1000)
+    evaluateImagePullFailures(pod, firstSeen, 300000, 50000)
+    expect(firstSeen.get('job')).toBe(1000)
+  })
+
+  it('clears tracking on recovery so a later failure gets a fresh grace window', () => {
+    const firstSeen = new Map<string, number>()
+    const failing = buildPod(PodPhase.PENDING, {
+      containerStatuses: [waitingContainer('job', 'ImagePullBackOff')]
+    })
+    const recovered = buildPod(PodPhase.PENDING, {
+      containerStatuses: [
+        { name: 'job', state: { running: {} } } as k8s.V1ContainerStatus
+      ]
+    })
+    evaluateImagePullFailures(failing, firstSeen, 300000, 1000)
+    expect(firstSeen.size).toBe(1)
+    evaluateImagePullFailures(recovered, firstSeen, 300000, 2000)
+    expect(firstSeen.size).toBe(0)
+    // A fresh failure starts a new grace window.
+    expect(evaluateImagePullFailures(failing, firstSeen, 300000, 3000)).toEqual(
+      []
+    )
+  })
+
+  it('tracks containers independently', () => {
+    const firstSeen = new Map<string, number>()
+    const now = 1000
+    firstSeen.set('old', now) // 'old' has been failing since `now`
+    const pod = buildPod(PodPhase.PENDING, {
+      containerStatuses: [
+        waitingContainer('old', 'ImagePullBackOff'),
+        waitingContainer('fresh', 'ImagePullBackOff')
+      ]
+    })
+    const errors = evaluateImagePullFailures(
+      pod,
+      firstSeen,
+      300000,
+      now + 300000
+    )
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('container "old"')
+    expect(errors[0]).not.toContain('"fresh"')
+    expect(firstSeen.get('fresh')).toBe(now + 300000)
   })
 })
 
@@ -590,6 +743,7 @@ describe('waitForPodPhases', () => {
   afterEach(() => {
     jest.restoreAllMocks()
     delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+    delete process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS']
   })
 
   it('returns once the pod reaches an awaited phase', async () => {
@@ -608,11 +762,72 @@ describe('waitForPodPhases', () => {
     readSpy.mockResolvedValue(
       podResult(
         buildPod(PodPhase.PENDING, {
+          containerStatuses: [waitingContainer('job', 'InvalidImageName', 'nope')]
+        })
+      )
+    )
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).rejects.toThrow('Pod my-pod has unrecoverable errors')
+  })
+
+  it('fails immediately on ImagePullBackOff when grace is set to 0 (old behavior)', async () => {
+    process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS'] = '0'
+    readSpy.mockResolvedValue(
+      podResult(
+        buildPod(PodPhase.PENDING, {
+          containerStatuses: [
+            waitingContainer('job', 'ImagePullBackOff', 'Back-off pulling image "nope:latest"')
+          ]
+        })
+      )
+    )
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).rejects.toThrow(/has unrecoverable errors:[\s\S]*ImagePullBackOff/)
+  })
+
+  it('keeps polling an image-pull failure within the grace period and succeeds once the pod becomes ready', async () => {
+    // Default grace (300s): a fresh ImagePullBackOff must NOT fail the job.
+    readSpy
+      .mockResolvedValueOnce(
+        podResult(
+          buildPod(PodPhase.PENDING, {
+            containerStatuses: [waitingContainer('job', 'ImagePullBackOff')]
+          })
+        )
+      )
+      .mockResolvedValueOnce(podResult(buildPod(PodPhase.RUNNING)))
+
+    await expect(
+      waitForPodPhases(
+        'my-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+    ).resolves.toBeUndefined()
+  })
+
+  it('fails immediately on a permanent image error even with a large grace period', async () => {
+    process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS'] = '600'
+    readSpy.mockResolvedValue(
+      podResult(
+        buildPod(PodPhase.PENDING, {
           containerStatuses: [
             waitingContainer(
               'job',
               'ImagePullBackOff',
-              'Back-off pulling image "nope:latest"'
+              'pull access denied for nope/nonexistent, repository does not exist or may require docker login'
             )
           ]
         })
@@ -625,7 +840,9 @@ describe('waitForPodPhases', () => {
         new Set([PodPhase.RUNNING]),
         new Set([PodPhase.PENDING])
       )
-    ).rejects.toThrow('Pod my-pod has unrecoverable errors')
+    ).rejects.toThrow(
+      /has unrecoverable errors:[\s\S]*\(permanent image error\)/
+    )
   })
 
   it('fast-fails on FailedMount events instead of polling to timeout', async () => {
