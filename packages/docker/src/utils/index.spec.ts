@@ -1,9 +1,4 @@
-import {
-  optionsWithDockerEnvs,
-  sanitize,
-  fixArgs,
-  checkEnvironment
-} from './index'
+import { optionsWithDockerEnvs, sanitize, fixArgs, checkEnvironment } from './index'
 
 describe('sanitize', () => {
   it('strips non-alphanumeric chars except underscore', () => {

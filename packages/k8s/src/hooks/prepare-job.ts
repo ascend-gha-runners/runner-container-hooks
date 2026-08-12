@@ -21,7 +21,6 @@ import {
   CONTAINER_VOLUMES,
   DEFAULT_CONTAINER_ENTRY_POINT,
   DEFAULT_CONTAINER_ENTRY_POINT_ARGS,
-  formatError,
   generateContainerName,
   mergeContainerWithOptions,
   readExtensionFromFile,
@@ -59,30 +58,14 @@ export async function prepareJob(
   }
 
   let services: k8s.V1Container[] = []
-  let serviceNames: string[] = []
   if (args.services?.length) {
-    const occurrences = new Map<string, number>()
-    for (const s of args.services) {
-      const base = generateContainerName(s.image)
-      occurrences.set(base, (occurrences.get(base) || 0) + 1)
-    }
-
-    const indices = new Map<string, number>()
     services = args.services.map(service => {
-      const base = generateContainerName(service.image)
-      const total = occurrences.get(base) || 0
-      const idx = indices.get(base) || 0
-
-      let name: string
-      if (total > 1) {
-        name = `${base}-${idx}`
-      } else {
-        name = base
-      }
-
-      indices.set(base, idx + 1)
-      serviceNames.push(name)
-      return createContainerSpec(service, name, false, extension)
+      return createContainerSpec(
+        service,
+        generateContainerName(service.image),
+        false,
+        extension
+      )
     })
   }
 
@@ -121,10 +104,9 @@ export async function prepareJob(
       // The boundary may be '"\nHeaders:' (real newline) or the literal
       // string ends before Headers — use the last '"' before 'Headers:' as fallback
       const headersIdx = raw.indexOf('Headers:')
-      const bodyEnd =
-        headersIdx !== -1
-          ? raw.lastIndexOf('"', headersIdx) // last " before Headers:
-          : raw.indexOf('"\nHeaders:')
+      const bodyEnd = headersIdx !== -1
+        ? raw.lastIndexOf('"', headersIdx)   // last " before Headers:
+        : raw.indexOf('"\nHeaders:')
       if (bodyStart !== -1 && bodyEnd !== -1 && bodyEnd > bodyStart) {
         // Body content is a JSON string literal (without surrounding quotes).
         // Wrap it in quotes and JSON.parse to properly unescape \" \\ \n \t etc.
@@ -164,11 +146,7 @@ export async function prepareJob(
     `Job pod created, waiting for it to come online ${createdPod?.metadata?.name}`
   )
 
-  const runnerWorkspaceEnv = process.env.RUNNER_WORKSPACE
-  if (!runnerWorkspaceEnv) {
-    throw new Error('RUNNER_WORKSPACE environment variable is not set')
-  }
-  const runnerWorkspace = dirname(runnerWorkspaceEnv)
+  const runnerWorkspace = dirname(process.env.RUNNER_WORKSPACE as string)
 
   let prepareScript: { containerPath: string; runnerPath: string } | undefined
   if (args.container?.userMountVolumes?.length) {
@@ -222,20 +200,21 @@ export async function prepareJob(
       JOB_CONTAINER_NAME
     )
   } catch (err) {
-    const message = formatError(err)
-    core.debug(`Failed to determine if the pod is alpine: ${message}`)
+    core.debug(
+      `Failed to determine if the pod is alpine: ${JSON.stringify(err)}`
+    )
+    const message = (err as any)?.response?.body?.message || err
     throw new Error(`failed to determine if the pod is alpine: ${message}`)
   }
   core.debug(`Setting isAlpine to ${isAlpine}`)
-  generateResponseFile(responseFile, args, createdPod, isAlpine, serviceNames)
+  generateResponseFile(responseFile, args, createdPod, isAlpine)
 }
 
 function generateResponseFile(
   responseFile: string,
   args: PrepareJobArgs,
   appPod: k8s.V1Pod,
-  isAlpine: boolean,
-  serviceNames?: string[]
+  isAlpine: boolean
 ): void {
   if (!appPod.metadata?.name) {
     throw new Error('app pod must have metadata.name specified')
@@ -268,9 +247,7 @@ function generateResponseFile(
 
   if (args.services?.length) {
     const serviceContainerNames =
-      serviceNames && serviceNames.length
-        ? serviceNames
-        : args.services?.map(s => generateContainerName(s.image)) || []
+      args.services?.map(s => generateContainerName(s.image)) || []
 
     response.context['services'] = appPod?.spec?.containers
       ?.filter(c => serviceContainerNames.includes(c.name))

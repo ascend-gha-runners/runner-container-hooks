@@ -15,7 +15,6 @@ import {
 } from '../hooks/constants'
 import {
   PodPhase,
-  formatError,
   mergePodSpecWithOptions,
   mergeObjectMeta,
   fixArgs,
@@ -26,8 +25,6 @@ import {
   WORK_VOLUME
 } from './utils'
 import * as shlex from 'shlex'
-import { parsePositiveMsEnv, WebSocketHeartbeat } from './heartbeat'
-import type { HeartbeatWebSocket } from './heartbeat'
 
 const kc = new k8s.KubeConfig()
 
@@ -254,31 +251,9 @@ export async function execPodStep(
   stdin?: stream.Readable
 ): Promise<number> {
   const exec = new k8s.Exec(kc)
-  core.debug(
-    `[execPodStep] Starting: cmd="${command[0]}" (${command.length} args), pod=${podName}, container=${containerName}`
-  )
 
   command = fixArgs(command)
-
-  const DEFAULT_PING_PERIOD_MS = 5000
-  const pingPeriodMs = parsePositiveMsEnv(
-    process.env.ACTIONS_RUNNER_HEARTBEAT_PERIOD_MS,
-    DEFAULT_PING_PERIOD_MS
-  )
-  const pongDeadlineMs = parsePositiveMsEnv(
-    process.env.ACTIONS_RUNNER_HEARTBEAT_DEADLINE_MS,
-    pingPeriodMs * 12 + 1000
-  )
-  core.debug(
-    `[execPodStep] Heartbeat config: pingPeriodMs=${pingPeriodMs}, pongDeadlineMs=${pongDeadlineMs}`
-  )
-
-  const heartbeat = new WebSocketHeartbeat(pingPeriodMs, pongDeadlineMs)
-
-  return new Promise<number>((resolve, reject) => {
-    core.debug('[execPodStep] About to call exec.exec')
-    let ws: HeartbeatWebSocket | null = null
-
+  return await new Promise(function (resolve, reject) {
     exec
       .exec(
         namespace(),
@@ -289,85 +264,22 @@ export async function execPodStep(
         process.stderr,
         stdin ?? null,
         false /* tty */,
-        async resp => {
-          core.debug(
-            `[execPodStep] execPodStep response: ${JSON.stringify(resp)}`
-          )
-
-          heartbeat.stop()
-
-          // Close WebSocket and wait for it before resolving/rejecting
-          const closeWebSocket = async (): Promise<void> => {
-            const socket = ws
-            if (
-              socket &&
-              (socket.readyState === 1 || socket.readyState === 0)
-            ) {
-              return new Promise<void>(closeResolve => {
-                const closeTimeout = setTimeout(() => {
-                  core.warning(
-                    '[execPodStep] WebSocket close timeout, forcing cleanup'
-                  )
-                  closeResolve()
-                }, 5000)
-
-                socket.once('close', () => {
-                  clearTimeout(closeTimeout)
-                  core.debug('[execPodStep] WebSocket closed cleanly')
-                  closeResolve()
-                })
-                socket.close()
-              })
-            }
-          }
-
+        resp => {
+          core.debug(`execPodStep response: ${JSON.stringify(resp)}`)
           if (resp.status === 'Success') {
-            core.debug(`[execPodStep] Success, code: ${resp.code}`)
-            await closeWebSocket()
             resolve(resp.code || 0)
           } else {
             core.debug(
-              `[execPodStep] Failure: ${JSON.stringify({ message: resp?.message, details: resp?.details })}`
+              JSON.stringify({
+                message: resp?.message,
+                details: resp?.details
+              })
             )
-            await closeWebSocket()
             reject(new Error(resp?.message || 'execPodStep failed'))
           }
         }
       )
-      .then(websocket => {
-        core.debug('[execPodStep] exec.exec resolved, ws object received')
-        ws = websocket
-        if (ws) {
-          heartbeat.start(ws, reject)
-        } else {
-          core.warning('[Heartbeat] WebSocket is null, heartbeat not started')
-        }
-      })
-      .catch(async e => {
-        heartbeat.stop()
-        core.error(`[execPodStep] exec.exec threw error: ${e}`)
-
-        // Close WebSocket before rejecting with timeout protection
-        const socket = ws
-        if (socket && (socket.readyState === 1 || socket.readyState === 0)) {
-          await new Promise<void>(closeResolve => {
-            const closeTimeout = setTimeout(() => {
-              core.warning(
-                '[execPodStep] WebSocket close timeout in error handler'
-              )
-              closeResolve()
-            }, 5000)
-
-            socket.once('close', () => {
-              clearTimeout(closeTimeout)
-              closeResolve()
-            })
-            socket.close()
-          })
-        }
-
-        reject(e)
-      })
+      .catch(e => reject(e))
   })
 }
 
@@ -388,7 +300,7 @@ export async function execPodStepWithOutput(
 
   // Ring buffer of the last N non-empty lines (cap to keep memory bounded).
   const buffer: string[] = []
-  const push = (line: string): void => {
+  const push = (line: string) => {
     if (line.length === 0) return
     buffer.push(line)
     if (buffer.length > tailLines) buffer.shift()
@@ -396,7 +308,7 @@ export async function execPodStepWithOutput(
 
   // Separate pending buffers per stream to prevent stdout/stderr interleaving.
   let pendingOut = ''
-  const ingestOut = (chunk: Buffer | string): void => {
+  const ingestOut = (chunk: Buffer | string) => {
     pendingOut += chunk.toString('utf8')
     const lines = pendingOut.split(/\r?\n/)
     pendingOut = lines.pop() ?? ''
@@ -404,14 +316,14 @@ export async function execPodStepWithOutput(
   }
 
   let pendingErr = ''
-  const ingestErr = (chunk: Buffer | string): void => {
+  const ingestErr = (chunk: Buffer | string) => {
     pendingErr += chunk.toString('utf8')
     const lines = pendingErr.split(/\r?\n/)
     pendingErr = lines.pop() ?? ''
     for (const line of lines) push(line)
   }
 
-  const flushPending = (): void => {
+  const flushPending = () => {
     if (pendingOut) {
       push(pendingOut)
       pendingOut = ''
@@ -632,7 +544,7 @@ export async function execCpToPod(
             false,
             async status => {
               if (errStream.size()) {
-                return reject(
+                reject(
                   new Error(
                     `Error from execCpToPod - status: ${status.status}, details: \n ${errStream.getContentsAsString()}`
                   )
@@ -649,7 +561,7 @@ export async function execCpToPod(
       attempt++
       if (attempt >= 30) {
         throw new Error(
-          `cpToPod failed after ${attempt} attempts: ${formatError(error)}`
+          `cpToPod failed after ${attempt} attempts: ${JSON.stringify(error)}`
         )
       }
       await sleep(1000)
@@ -770,9 +682,9 @@ export async function execCpFromPod(
             errStream,
             null,
             false,
-            async (_s: k8s.V1Status) => {
+            async _status => {
               if (errStream.size()) {
-                return reject(
+                reject(
                   new Error(
                     `Error from cpFromPod - details: \n ${errStream.getContentsAsString()}`
                   )
@@ -788,7 +700,7 @@ export async function execCpFromPod(
       attempt++
       if (attempt >= 30) {
         throw new Error(
-          `execCpFromPod failed after ${attempt} attempts: ${formatError(error)}`
+          `execCpFromPod failed after ${attempt} attempts: ${JSON.stringify(error)}`
         )
       }
       await sleep(1000)
@@ -864,7 +776,7 @@ export async function waitForJobToComplete(jobName: string): Promise<void> {
         return
       }
     } catch (error) {
-      throw new Error(`job ${jobName} has failed: ${formatError(error)}`)
+      throw new Error(`job ${jobName} has failed: ${JSON.stringify(error)}`)
     }
     await backOffManager.backOff()
   }
@@ -964,12 +876,6 @@ export async function pruneSecrets(): Promise<void> {
 }
 
 export const UNRECOVERABLE_WAITING_REASONS = new Set([
-  // k8s has already retried image pull multiple times with exponential backoff.
-  // ErrImagePull is excluded: it fires on the first failure (could be a transient
-  // TLS timeout or network blip) and k8s will naturally promote it to
-  // ImagePullBackOff after a moment. Fast-failing on ErrImagePull would kill
-  // jobs that would have succeeded on the next pull attempt.
-  'ImagePullBackOff',
   // Image name is syntactically invalid — cannot self-heal without a config fix.
   'InvalidImageName',
   // Container spec is invalid (bad env vars, resource limits, securityContext) —
@@ -978,7 +884,73 @@ export const UNRECOVERABLE_WAITING_REASONS = new Set([
   // CreateContainerError is excluded: it is sometimes emitted transiently by the
   // container runtime (e.g. during a node-level runtime restart). It can
   // self-resolve on the next kubelet retry cycle.
+  //
+  // ImagePullBackOff and ErrImagePull are also excluded from this set. k8s
+  // promotes to ImagePullBackOff from the second pull attempt, so fast-failing
+  // on it would kill jobs during a transient network outage. They are instead
+  // handled by the image-pull grace window in waitForPodPhases (see
+  // IMAGE_PULL_WAITING_REASONS / evaluateImagePullFailures): the hook waits a
+  // bounded grace period for the pull to self-heal and only then fails, unless
+  // the waiting message positively identifies a permanent cause.
 ])
+
+// Waiting reasons that indicate the container image could not be pulled yet.
+// Unlike UNRECOVERABLE_WAITING_REASONS these are NOT failed instantly: a pull
+// can be stuck transiently (DNS/TLS/registry outage) and self-heal on a later
+// kubelet retry. waitForPodPhases gives them a bounded grace period (see
+// getImagePullGraceMs / evaluateImagePullFailures) and only fails once that
+// grace is exceeded without recovery — or immediately when the waiting message
+// positively identifies a permanent cause (see PERMANENT_IMAGE_PULL_PATTERNS).
+export const IMAGE_PULL_WAITING_REASONS = new Set([
+  'ImagePullBackOff',
+  'ErrImagePull'
+])
+
+// Waiting messages that POSITIVELY IDENTIFY a permanent image-pull failure that
+// will not self-heal even if the network recovers (wrong image/tag, missing
+// registry repository, invalid credentials). When one of these matches,
+// fast-fail immediately, skipping the grace period. Anything else (network /
+// TLS / timeout errors) is treated as transient and given the grace window.
+//
+// Permanent examples (WILL fast-fail immediately):
+//   "pull access denied for nope/nonexistent, repository does not exist or may require 'docker login'"
+//   "manifest for nope:latest not found"
+//   "unauthorized: authentication required"
+//
+// Transient examples (grace window applies):
+//   "dial tcp 10.0.0.1:443: connect: connection refused"
+//   "TLS handshake timeout"
+//   "failed to resolve reference: ... i/o timeout"
+export const PERMANENT_IMAGE_PULL_PATTERNS: readonly RegExp[] = [
+  /manifest .*not found/i,
+  /pull access denied/i,
+  /unauthorized/i,
+  /repository does not exist/i,
+  /image not known/i,
+  /denied: requested access/i,
+  /no such image/i
+]
+
+export const DEFAULT_IMAGE_PULL_GRACE_MS = 5 * 60 * 1000 // 5 min
+
+// How long an image-pull failure may persist before the hook gives up. Reads
+// ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS (default 300). A value of 0
+// restores the old behavior: fail as soon as the pull failure is observed.
+export function getImagePullGraceMs(): number {
+  const envGraceSeconds =
+    process.env['ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS']
+  if (!envGraceSeconds) {
+    return DEFAULT_IMAGE_PULL_GRACE_MS
+  }
+  const graceSeconds = parseInt(envGraceSeconds, 10)
+  if (Number.isNaN(graceSeconds) || graceSeconds < 0) {
+    core.warning(
+      `Image pull grace is invalid ("${envGraceSeconds}"): use an int >= 0, falling back to ${DEFAULT_IMAGE_PULL_GRACE_MS / 1000}s`
+    )
+    return DEFAULT_IMAGE_PULL_GRACE_MS
+  }
+  return graceSeconds * 1000
+}
 
 // Pod *event* reasons (from the event stream, not container status) that
 // indicate a permanent failure the pod will never recover from on its own.
@@ -1153,6 +1125,14 @@ function getWaitingReasonHint(reason: string): string {
         `    - Network connectivity from the node to the registry (DNS, firewall, proxy, TLS)`,
         `    Run: kubectl describe pod <pod> | grep -A10 "Events"`
       ].join('\n')
+    case 'ErrImagePull':
+      return [
+        `  → Image pull failed and did not recover within the grace period. Check:`,
+        `    - Image name and tag are correct and exist in the registry`,
+        `    - If private registry: imagePullSecret is configured and credentials are valid`,
+        `    - Network connectivity from the node to the registry (DNS, firewall, proxy, TLS)`,
+        `    Run: kubectl describe pod <pod> | grep -A10 "Events"`
+      ].join('\n')
     case 'InvalidImageName':
       return `  → Image name is malformed. Check the workflow/job container image configuration.`
     case 'CreateContainerConfigError':
@@ -1176,6 +1156,60 @@ export function getContainerErrors(pod: k8s.V1Pod): string[] {
       const detail = waiting.message ? `\n    ${waiting.message}` : ''
       const hint = `\n${getWaitingReasonHint(waiting.reason)}`
       errors.push(`${reason}${detail}${hint}`)
+    }
+  }
+  return errors
+}
+
+// Tracks, per container, the first time it was observed in an image-pull-failure
+// waiting state (ImagePullBackOff / ErrImagePull) and reports an error for any
+// container whose failure has either (a) persisted continuously beyond graceMs,
+// or (b) a waiting message matching PERMANENT_IMAGE_PULL_PATTERNS. Containers
+// that recover (leave the image-pull-failure state) have their tracking entry
+// cleared, so a later pull failure starts a fresh grace window. `firstSeen` is
+// mutated in place and must be owned by the caller (one per waitForPodPhases
+// loop). `now` is injected for testability.
+export function evaluateImagePullFailures(
+  pod: k8s.V1Pod,
+  firstSeen: Map<string, number>,
+  graceMs: number,
+  now: number
+): string[] {
+  const allStatuses = [
+    ...(pod.status?.initContainerStatuses ?? []),
+    ...(pod.status?.containerStatuses ?? [])
+  ]
+  const errors: string[] = []
+  const currentlyFailing = new Set<string>()
+  for (const cs of allStatuses) {
+    const waiting = cs.state?.waiting
+    if (!waiting?.reason || !IMAGE_PULL_WAITING_REASONS.has(waiting.reason)) {
+      continue
+    }
+    currentlyFailing.add(cs.name)
+    if (!firstSeen.has(cs.name)) {
+      firstSeen.set(cs.name, now)
+    }
+    const startedAt = firstSeen.get(cs.name) as number
+    const message = waiting.message ?? ''
+    const permanent = PERMANENT_IMAGE_PULL_PATTERNS.some(p => p.test(message))
+    const elapsed = now - startedAt
+    if (!permanent && elapsed < graceMs) {
+      continue
+    }
+    const qualifier = permanent
+      ? '(permanent image error)'
+      : `(failed for ${Math.round(elapsed / 1000)}s, exceeding the ${Math.round(graceMs / 1000)}s grace period)`
+    const reason = `  ✗ container "${cs.name}": ${waiting.reason} ${qualifier}`
+    const detail = message ? `\n    ${message}` : ''
+    const hint = `\n${getWaitingReasonHint(waiting.reason)}`
+    errors.push(`${reason}${detail}${hint}`)
+  }
+  // Drop tracking for containers no longer in an image-pull-failure state so a
+  // later failure gets a fresh grace window.
+  for (const name of Array.from(firstSeen.keys())) {
+    if (!currentlyFailing.has(name)) {
+      firstSeen.delete(name)
     }
   }
   return errors
@@ -1275,7 +1309,7 @@ export async function getPodEventErrors(podName: string): Promise<string[]> {
       namespace: namespace(),
       fieldSelector: `involvedObject.name=${podName}`
     })
-    items = result.items ?? []
+    items = result.items
   } catch (err) {
     core.debug(
       `Could not list events for pod ${podName} during fast-fail check: ${
@@ -1371,9 +1405,12 @@ export async function describePodFailure(podName: string): Promise<string> {
   for (const cs of allStatuses) {
     const waiting = cs.state?.waiting
     if (waiting?.reason) {
-      // Skip reasons already surfaced by getContainerErrors() in the caller's
-      // first line to avoid printing the same error twice.
-      if (!unrecoverableReasons.has(waiting.reason)) {
+      // Skip reasons already surfaced by getContainerErrors() or the image-pull
+      // grace fast-fail to avoid printing the same error twice.
+      if (
+        !unrecoverableReasons.has(waiting.reason) &&
+        !IMAGE_PULL_WAITING_REASONS.has(waiting.reason)
+      ) {
         const msg = waiting.message ? `\n    ${waiting.message}` : ''
         containerLines.push(
           `  ✗ container "${cs.name}" waiting: ${waiting.reason}${msg}`
@@ -1416,7 +1453,7 @@ async function describePodWarningEvents(podName: string): Promise<string[]> {
       namespace: namespace(),
       fieldSelector: `involvedObject.name=${podName}`
     })
-    items = result.items ?? []
+    items = result.items
   } catch (err) {
     core.debug(
       `Could not list events for pod ${podName} (the 'events' permission may be missing): ${
@@ -1456,7 +1493,7 @@ async function describePodWarningEvents(podName: string): Promise<string[]> {
 // until the timeout, not terminate early. This function always returns [] as a
 // result, but is kept so checkUnrecoverableErrors compiles and the dedup logic
 // remains intact for future use.
-export function getPodConditionErrors(_p: k8s.V1Pod): string[] {
+export function getPodConditionErrors(_pod: k8s.V1Pod): string[] {
   return []
 }
 
@@ -1500,6 +1537,10 @@ export async function waitForPodPhases(
   maxTimeSeconds = DEFAULT_WAIT_FOR_POD_TIME_SECONDS
 ): Promise<void> {
   const backOffManager = new BackOffManager(maxTimeSeconds)
+  // Per-container first-observation timestamps for the image-pull grace window
+  // (see evaluateImagePullFailures). Mutated in place across poll iterations.
+  const imagePullFirstSeen = new Map<string, number>()
+  const imagePullGraceMs = getImagePullGraceMs()
   let phase: PodPhase = PodPhase.UNKNOWN
   while (true) {
     let pod: k8s.V1Pod
@@ -1548,20 +1589,28 @@ export async function waitForPodPhases(
       )
     }
 
-    // Still in a back-off phase, but a deterministic unrecoverable error
-    // was detected (container / event / condition). Fail fast with
-    // diagnostics instead of waiting out the full timeout.
+    // Still in a back-off phase, but a deterministic unrecoverable error was
+    // detected (container / event / condition) OR an image-pull failure has
+    // persisted past its grace period / matched a permanent pattern. Fail fast
+    // with diagnostics instead of waiting out the full timeout.
+    const imagePullErrors = evaluateImagePullFailures(
+      pod,
+      imagePullFirstSeen,
+      imagePullGraceMs,
+      Date.now()
+    )
     const errors = await checkUnrecoverableErrors(pod, podName)
-    if (errors.length > 0) {
+    const allErrors = [...imagePullErrors, ...errors]
+    if (allErrors.length > 0) {
       const details = await describePodFailure(podName)
       throw new Error(
-        `Pod ${podName} has unrecoverable errors:\n${errors.join('\n')}\n${'-'.repeat(60)}\n${details}`
+        `Pod ${podName} has unrecoverable errors:\n${allErrors.join('\n')}\n${'-'.repeat(60)}\n${details}`
       )
     }
 
     try {
       await backOffManager.backOff()
-    } catch (_err) {
+    } catch (error) {
       // BackOffManager throws "backoff timeout" when maxTimeSeconds is exceeded.
       // Don't surface that bare message: collect diagnostics first so the user
       // can see WHY the pod never became ready.
@@ -1636,18 +1685,16 @@ export async function getPodLogs(
     process.stdout.write(chunk)
   })
 
+  logStream.on('error', err => {
+    process.stderr.write(err.message)
+  })
+
   await log.log(namespace(), podName, containerName, logStream, {
     follow: true,
     pretty: false,
     timestamps: false
   })
-  await new Promise((resolve, reject) => {
-    logStream.on('end', () => resolve(null))
-    logStream.on('error', err => {
-      process.stderr.write(err.message)
-      reject(err)
-    })
-  })
+  await new Promise(resolve => logStream.on('end', () => resolve(null)))
 }
 
 export async function prunePods(): Promise<void> {
@@ -1707,7 +1754,7 @@ export async function isPodContainerAlpine(
       [
         'sh',
         '-c',
-        `[ $(cat /etc/*release* | grep -i -e "^ID=*alpine*" -c) != 0 ] || exit 1`
+        `'[ $(cat /etc/*release* | grep -i -e "^ID=*alpine*" -c) != 0 ] || exit 1'`
       ],
       podName,
       containerName

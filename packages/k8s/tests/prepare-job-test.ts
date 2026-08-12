@@ -45,7 +45,7 @@ describe('Prepare job', () => {
       process.env.GITHUB_WORKSPACE as string,
       'myvolume'
     )
-    fs.mkdirSync(userVolumeMount, { recursive: true })
+    fs.mkdirSync(userVolumeMount)
     fs.writeFileSync(path.join(userVolumeMount, 'file.txt'), 'hello')
     prepareJobData.args.container.userMountVolumes = [
       {
@@ -63,7 +63,11 @@ describe('Prepare job', () => {
     )
 
     await execPodStep(
-      ['sh', '-c', '[ "$(cat /__w/myvolume/file.txt)" = "hello" ] || exit 5'],
+      [
+        'sh',
+        '-c',
+        '\'[ "$(cat /__w/myvolume/file.txt)" = "hello" ] || exit 5\''
+      ],
       content!.state!.jobPod,
       JOB_CONTAINER_NAME
     ).then(output => {
@@ -242,38 +246,5 @@ describe('Prepare job', () => {
     expect(content.context.container.image).toBe(
       'ghcr.io/actions/actions-runner:latest'
     )
-  })
-
-  it('should create unique service container names when images collide', async () => {
-    // Use fixed, non-colliding high ports. (Kubernetes hostPort must be unique per node.)
-    prepareJobData.args.container.portMappings = ['31080:8080']
-
-    // make two services with the same image
-    const svc = JSON.parse(JSON.stringify(prepareJobData.args.services[0]))
-    const svc2 = JSON.parse(JSON.stringify(svc))
-    // Ensure unique host ports so the pod spec is valid even with two services.
-    // (Kubernetes hostPort must be unique per node.)
-    svc.portMappings = ['31081:80', '31082:8080']
-    svc2.portMappings = ['31083:80', '31084:8080']
-    prepareJobData.args.services = [svc, svc2]
-    // ensure registries are null as TestHelper expects
-    prepareJobData.args.services.forEach((s: any) => (s.registry = null))
-
-    await expect(
-      prepareJob(prepareJobData.args, prepareJobOutputFilePath)
-    ).resolves.not.toThrow()
-
-    const content = JSON.parse(
-      fs.readFileSync(prepareJobOutputFilePath).toString()
-    )
-
-    expect(content.context.services).toBeTruthy()
-    expect(content.context.services.length).toBe(2)
-
-    const got = await getPodByName(content.state.jobPod)
-    const names = (got.spec?.containers || []).map(c => c.name)
-
-    // when images collide, names should be suffixed with -0, -1
-    expect(names).toEqual(expect.arrayContaining(['redis-0', 'redis-1']))
   })
 })

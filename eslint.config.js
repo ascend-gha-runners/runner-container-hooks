@@ -35,14 +35,7 @@ module.exports = [
       'no-shadow': 'off',
 
       // TypeScript ESLint rules
-      '@typescript-eslint/no-unused-vars': [
-        'error',
-        {
-          argsIgnorePattern: '^_',
-          caughtErrorsIgnorePattern: '^_',
-          varsIgnorePattern: '^_'
-        }
-      ],
+      '@typescript-eslint/no-unused-vars': 'error',
       '@typescript-eslint/explicit-member-accessibility': ['error', { accessibility: 'no-public' }],
       '@typescript-eslint/no-require-imports': 'error',
       '@typescript-eslint/array-type': 'error',

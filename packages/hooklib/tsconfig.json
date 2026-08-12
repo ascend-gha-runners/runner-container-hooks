@@ -3,14 +3,9 @@
     "compilerOptions": {
       "baseUrl": "./",
       "outDir": "./lib",
-      "rootDir": "./src",
-      "skipLibCheck": true,
-      "types": ["node"]
+      "rootDir": "./src"
     },
     "include": [
       "./src"
-    ],
-    "exclude": [
-      "src/**/*.spec.ts"
     ]
   }

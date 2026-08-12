@@ -36,9 +36,7 @@ export function prepareJobScript(userVolumeMounts: Mount[]): {
   containerPath: string
   runnerPath: string
 } {
-  let mountDirs = userVolumeMounts
-    .map(m => shlex.quote(m.targetVolumePath))
-    .join(' ')
+  let mountDirs = userVolumeMounts.map(m => m.targetVolumePath).join(' ')
 
   const content = `#!/bin/sh -l
 set -e
@@ -110,10 +108,10 @@ rm "$0" # remove script after running
 mv /__w/_temp/_github_home /github/home && \
 mv /__w/_temp/_github_workflow /github/workflow && \
 mv /__w/_temp/_runner_file_commands /github/file_commands || true && \
-mv ${shlex.quote('/__w/' + parts.join('/') + '/')} /github/workspace && \
+mv /__w/${parts.join('/')}/ /github/workspace && \
 cd /github/workspace && \
-exec ${environmentPrefix} ${shlex.quote(entryPoint)} ${
-    entryPointArgs?.length ? entryPointArgs.map(shlex.quote).join(' ') : ''
+exec ${environmentPrefix} ${entryPoint} ${
+    entryPointArgs?.length ? entryPointArgs.join(' ') : ''
   }
 `
   const filename = `${uuidv4()}.sh`
@@ -290,11 +288,6 @@ function mergeLists<T>(base?: T[], from?: T[]): T[] {
 }
 
 export function fixArgs(args: string[]): string[] {
-  // Preserve shell command strings passed via `sh -c` without re-tokenizing.
-  // Retokenizing would split the script into multiple args, breaking `sh -c`.
-  if (args.length >= 2 && args[0] === 'sh' && args[1] === '-c') {
-    return args
-  }
   return shlex.split(args.join(' '))
 }
 
@@ -304,55 +297,4 @@ export async function sleep(ms: number): Promise<void> {
 
 export function listDirAllCommand(dir: string): string {
   return `cd ${shlex.quote(dir)} && find . -type f -not -path '*/_runner_hook_responses*' -exec stat -c '%s %n' {} \\;`
-}
-
-// Safely turn an unknown thrown value into a diagnostic string without
-// throwing. The previous `JSON.stringify(err)` pattern crashed with
-// `TypeError: Converting circular structure to JSON` when err was a
-// @kubernetes/client-node HTTP error (its response embeds a
-// TLSSocket <-> HTTPParser cycle). The thrown TypeError shadowed the
-// original failure in every catch block that used it (issue #329).
-export function formatError(err: unknown): string {
-  if (err === null || err === undefined) {
-    return String(err)
-  }
-
-  // @kubernetes/client-node API errors expose the actual server message
-  // under response.body — prefer that when available.
-  const body =
-    (err as { response?: { body?: unknown } })?.response?.body ??
-    (err as { body?: unknown })?.body
-  if (body && typeof body === 'object') {
-    const msg = (body as { message?: unknown }).message
-    const reason = (body as { reason?: unknown }).reason
-    if (typeof msg === 'string') {
-      return typeof reason === 'string' && reason.length > 0
-        ? `${msg} (reason: ${reason})`
-        : msg
-    }
-  }
-
-  if (err instanceof Error) {
-    return err.message
-  }
-
-  if (typeof err === 'object') {
-    // Non-Error objects sometimes carry a top-level message (axios-style
-    // errors, hand-rolled error-likes). Extract before the JSON.stringify
-    // branch so a circular ref doesn't reduce the diagnostic to
-    // "[object Object]".
-    const msg = (err as { message?: unknown }).message
-    if (typeof msg === 'string') {
-      return msg
-    }
-    try {
-      return JSON.stringify(err)
-    } catch {
-      return String(err)
-    }
-  }
-
-  // Primitives serialise more readably via String() than JSON.stringify
-  // (which would quote strings and refuse to handle symbols).
-  return String(err)
 }
