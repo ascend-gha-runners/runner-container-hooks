@@ -1,0 +1,34 @@
+packages/k8s/tests/wait-for-pod-phases-test.ts
+  s_17293426bde522::t_b3c222790f4cc6 4,7,130-133,143,146,164-166,171-173,190-338,746,762-822,830,843-845
+packages/k8s/src/k8s/index.ts
+  s_17293426bde522::t_267c41003277bd 869,873-880,883-940,1109-1117,1147-1200,1381-1386,1481-1483,1505-1508,1557-1566,1568-1569,1572
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "ad0890791b4cff362f6751bfb830f70c1dd4547e",
+  "prompts": {},
+  "sessions": {
+    "s_17293426bde522": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a7ac4f1d5f263fb9f02543a",
+        "model": "glm-5.2"
+      },
+      "human_author": "Longwt123 <1075015495@qq.com>",
+      "custom_attributes": {
+        "operation_id": "6a7af176d5f263fb9f0254f9",
+        "runtime_client": "trae-tob-git-ai",
+        "external_session_id": "6a7ac4f1d5f263fb9f02543a",
+        "session_id": "6a7ac4f1d5f263fb9f02543a",
+        "source_scene": "agent",
+        "tool_use_id": "6a7af176d5f263fb9f0254f9",
+        "edit_kind": "file_edit",
+        "dedupe_key": "6a7ac4f1d5f263fb9f02543a:6a7af176d5f263fb9f0254f9:afterEdit:797d8d64",
+        "tool_type": "builtin",
+        "client_type": "ide",
+        "tool_id": "icube:applyChatSnapshotPatch"
+      }
+    }
+  }
+}
