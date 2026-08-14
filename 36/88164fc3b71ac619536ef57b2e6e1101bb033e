@@ -1,0 +1,19 @@
+packages/k8s/src/k8s/index.ts
+  s_17293426bde522::t_4c54db5cb2bc01 303,311,319,326,685,1372,1477
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "3688164fc3b71ac619536ef57b2e6e1101bb033e",
+  "prompts": {},
+  "sessions": {
+    "s_17293426bde522": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a7ac4f1d5f263fb9f02543a",
+        "model": "glm-5.2__dev"
+      },
+      "human_author": "Longwt123 <1075015495@qq.com>"
+    }
+  }
+}
