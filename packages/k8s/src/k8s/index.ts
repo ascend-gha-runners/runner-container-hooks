@@ -25,6 +25,7 @@ import {
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
 } from './utils'
+import { maybeInjectTransparentCache } from './utils/transparent-cache'
 import * as shlex from 'shlex'
 import { parsePositiveMsEnv, WebSocketHeartbeat } from './heartbeat'
 import type { HeartbeatWebSocket } from './heartbeat'
@@ -65,6 +66,15 @@ export const requiredPermissions = [
     subresource: ''
   }
 ]
+
+async function cacheSecretExists(name: string): Promise<boolean> {
+  try {
+    await k8sApi.readNamespacedSecret({ namespace: namespace(), name })
+    return true
+  } catch {
+    return false
+  }
+}
 
 export async function createJobPod(
   name: string,
@@ -180,6 +190,13 @@ export async function createJobPod(
     mergePodSpecWithOptions(appPod.spec, extension.spec)
   }
 
+  // Transparent cache injection (issue #1133): no-op unless the runner env
+  // enables it, and never overrides env/volumes set by the workflow or the
+  // extension template above.
+  await maybeInjectTransparentCache(appPod.spec, process.env, {
+    secretExists: cacheSecretExists
+  })
+
   return await k8sApi.createNamespacedPod({
     namespace: namespace(),
     body: appPod
@@ -232,6 +249,10 @@ export async function createContainerStepPod(
   if (extension?.spec) {
     mergePodSpecWithOptions(appPod.spec, extension.spec)
   }
+
+  await maybeInjectTransparentCache(appPod.spec, process.env, {
+    secretExists: cacheSecretExists
+  })
 
   return await k8sApi.createNamespacedPod({
     namespace: namespace(),
