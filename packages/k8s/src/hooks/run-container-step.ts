@@ -31,6 +31,7 @@ import {
   JOB_CONTAINER_EXTENSION_NAME,
   JOB_CONTAINER_NAME
 } from './constants'
+import { maybeInjectNpuMetrics } from '../k8s/utils/npu-metrics'
 
 export async function runContainerStep(
   stepContainer: RunContainerStepArgs
@@ -54,6 +55,7 @@ export async function runContainerStep(
   const extension = readExtensionFromFile()
 
   const container = createContainerSpec(stepContainer, extension)
+  maybeInjectNpuMetrics(container)
 
   let pod: k8s.V1Pod
   try {

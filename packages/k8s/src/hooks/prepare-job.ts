@@ -34,6 +34,7 @@ import {
   getJobPodName,
   JOB_CONTAINER_NAME
 } from './constants'
+import { maybeInjectNpuMetrics } from '../k8s/utils/npu-metrics'
 import { dirname } from 'path'
 
 export async function prepareJob(
@@ -56,6 +57,7 @@ export async function prepareJob(
       true,
       extension
     )
+    maybeInjectNpuMetrics(container)
   }
 
   let services: k8s.V1Container[] = []

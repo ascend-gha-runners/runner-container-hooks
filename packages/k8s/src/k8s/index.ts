@@ -1821,3 +1821,18 @@ export async function getPodByName(name): Promise<k8s.V1Pod> {
     namespace: namespace()
   })
 }
+
+export async function getSecretByName(name: string): Promise<k8s.V1Secret> {
+  return await k8sApi.readNamespacedSecret({
+    name,
+    namespace: namespace()
+  })
+}
+
+export async function listPodsByRunnerInstance(): Promise<k8s.V1Pod[]> {
+  const podList = await k8sApi.listNamespacedPod({
+    namespace: namespace(),
+    labelSelector: new RunnerInstanceLabel().toString()
+  })
+  return podList.items ?? []
+}

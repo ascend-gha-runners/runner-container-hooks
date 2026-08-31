@@ -36,6 +36,8 @@ import {
   containerPorts,
   getPodLogs,
   getPodByName,
+  getSecretByName,
+  listPodsByRunnerInstance,
   execPodStepWithOutput,
   execPodStep
 } from '../index'
@@ -862,10 +864,20 @@ describe('namespace fallbacks', () => {
     delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
   })
 
-  it('throws when no namespace source is available', () => {
+  it('resolves a fallback or throws when no namespace source is available', () => {
     delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
-    // ServiceAccount file does not exist on dev/CI machines → throws ENOENT
-    expect(() => namespace()).toThrow(/Failed to determine namespace/)
+    // Outside a pod: no kubeconfig namespace and no ServiceAccount file →
+    // throws ENOENT. Inside a pod (e.g. CI runners): the SA file (or a
+    // kubeconfig context) legitimately resolves the namespace.
+    let resolved: string | undefined
+    try {
+      resolved = namespace()
+    } catch (err) {
+      expect(String(err)).toMatch(/Failed to determine namespace/)
+      return
+    }
+    expect(typeof resolved).toBe('string')
+    expect(resolved?.length).toBeGreaterThan(0)
   })
 })
 
@@ -1751,6 +1763,86 @@ describe('getPodByName', () => {
   it('propagates API errors', async () => {
     readSpy.mockRejectedValue(new Error('not found') as never)
     await expect(getPodByName('missing-pod')).rejects.toThrow('not found')
+  })
+})
+
+// ── getSecretByName ───────────────────────────────────────────────────────────
+
+describe('getSecretByName', () => {
+  let readSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    readSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'readNamespacedSecret' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+  })
+
+  it('returns the secret from the API', async () => {
+    const fakeSecret = {
+      data: { PUSHGATEWAY_URL: 'aHR0cDovL3Bndzo5MDkx' }
+    } as k8s.V1Secret
+    readSpy.mockResolvedValue(fakeSecret as never)
+    const secret = await getSecretByName('npu-metrics-pushgw')
+    expect(readSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'npu-metrics-pushgw',
+        namespace: 'default'
+      })
+    )
+    expect(secret).toBe(fakeSecret)
+  })
+
+  it('propagates API errors', async () => {
+    readSpy.mockRejectedValue(new Error('forbidden') as never)
+    await expect(getSecretByName('nope')).rejects.toThrow('forbidden')
+  })
+})
+
+// ── listPodsByRunnerInstance ──────────────────────────────────────────────────
+
+describe('listPodsByRunnerInstance', () => {
+  let listSpy: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    process.env['ACTIONS_RUNNER_POD_NAME'] = 'my-runner-pod'
+    process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE'] = 'default'
+    listSpy = vi.spyOn(k8s.CoreV1Api.prototype, 'listNamespacedPod' as any)
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete process.env['ACTIONS_RUNNER_KUBERNETES_NAMESPACE']
+    delete process.env['ACTIONS_RUNNER_POD_NAME']
+  })
+
+  it('lists pods with the runner-pod label selector', async () => {
+    const fakeList = {
+      items: [buildPod('Running'), buildPod('Succeeded')]
+    } as never
+    listSpy.mockResolvedValue(fakeList)
+    const pods = await listPodsByRunnerInstance()
+    expect(listSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: 'default',
+        labelSelector: 'runner-pod=my-runner-pod'
+      })
+    )
+    expect(pods).toHaveLength(2)
+  })
+
+  it('returns an empty list when no pods match', async () => {
+    listSpy.mockResolvedValue({ items: [] } as never)
+    const pods = await listPodsByRunnerInstance()
+    expect(pods).toEqual([])
+  })
+
+  it('propagates API errors', async () => {
+    listSpy.mockRejectedValue(new Error('forbidden') as never)
+    await expect(listPodsByRunnerInstance()).rejects.toThrow('forbidden')
   })
 })
 
