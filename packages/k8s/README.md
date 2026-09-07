@@ -26,6 +26,16 @@ rules:
   resources: ["secrets"]
   verbs: ["get", "list", "create", "delete"]
 ```
+- (Optional, recommended) Granting `events` read access lets the hooks attach
+  recent `Warning` events (e.g. `FailedScheduling`, `FailedMount`) to the error
+  message when a pod fails to come online. This permission is **not required** —
+  if it is missing the hooks still work, they just omit the event section from
+  diagnostics.
+```
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list"]
+```
 - The `ACTIONS_RUNNER_POD_NAME` env should be set to the name of the pod
 - The `ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER` env should be set to true to prevent the runner from running any jobs outside of a container
 - The runner pod should map a persistent volume claim into the `_work` directory
@@ -33,6 +43,20 @@ rules:
 - Some actions runner env's are expected to be set. These are set automatically by the runner.
     - `RUNNER_WORKSPACE` is expected to be set to the workspace of the runner
     - `GITHUB_WORKSPACE` is expected to be set to the workspace of the job
+- Optional tuning env's
+    - `ACTIONS_RUNNER_K8S_UNRECOVERABLE_WAITING_REASONS` — comma-separated list of
+      extra container `waiting` reasons that should be treated as deterministic
+      terminal failures (fail fast instead of waiting for the timeout). These are
+      *added* to the built-ins (`InvalidImageName`, `CreateContainerConfigError`);
+      the built-ins can never be removed. Use with care — only list reasons that
+      are truly unrecoverable for your workloads (e.g. `CrashLoopBackOff`).
+    - `ACTIONS_RUNNER_K8S_IMAGE_PULL_GRACE_SECONDS` — how long `ImagePullBackOff`
+      / `ErrImagePull` may persist before the hook fails the job (default `300`,
+      i.e. 5 minutes). The pod is given this window to self-heal, e.g. during a
+      transient network outage. Permanent image errors (bad tag, invalid
+      credentials, missing repository) are detected from the waiting message and
+      still fail immediately. Set to `0` to fail as soon as the pull failure is
+      observed (the previous behavior).
 
 
 ## Limitations
