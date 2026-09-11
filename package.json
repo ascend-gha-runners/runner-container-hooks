@@ -38,7 +38,7 @@
     "globals": "^15.12.0",
     "prettier": "^3.6.2",
     "typescript": "^5.8.3",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   },
   "dependencies": {
     "eslint-plugin-jest": "^29.0.1"
